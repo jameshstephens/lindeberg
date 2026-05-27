@@ -1,11 +1,45 @@
 \chapter{The formalized Lindeberg principle}
 
-This blueprint tracks the Lean formalization in
-\texttt{Lindeberg/Basic.lean}.  Its endpoint is Chatterjee's Theorem 1.1 in
-the form formalized by
-\texttt{theoremOneOne\_paper\_statement}: the comparison vector \(Y\) has
-independent coordinates, while no independence assumption is made between the
-original vectors \(X\) and \(Y\).  Lean removes that auxiliary assumption by
+\begin{theorem}[Theorem 1.1, formalized]\label{thm:theorem-one-one}
+\lean{Lindeberg.theoremOneOne_paper_statement}
+\uses{thm:independent-coupling, lem:product-transfer, lem:error-transfer, lem:third-moment-integrability}
+\leanok
+Let \((\Omega,\mu)\) be a probability space, let
+\(X,Y:\Omega\to(\operatorname{Fin} n\to\mathbb{R})\) have measurable
+coordinates, and assume the \(Y_i\)'s are mutually independent.  Suppose
+\[
+  \int |X_i|^3\,d\mu<\infty,\qquad
+  \int |Y_i|^3\,d\mu<\infty,
+\]
+and
+\[
+  \int |X_i|^3\,d\mu+\int |Y_i|^3\,d\mu\le M_3
+  \quad\text{for every } i.
+\]
+If \(f:\mathbb{R}^n\to\mathbb{R}\) is \(C^3\) and its \(r\)-fold coordinate
+partials satisfy
+\[
+  |\partial_i^r f(x)|\le L_r
+  \qquad (r=1,2,3),
+\]
+then, with \(A_i\) and \(B_i\) defined using the past sigma-algebra generated
+by \(X_j\) for \(j<i\),
+\[
+\begin{aligned}
+  \left|\int_\Omega f(X(\omega))\,d\mu(\omega)
+  -\int_\Omega f(Y(\omega))\,d\mu(\omega)\right|
+  &\le
+  \sum_{i:\operatorname{Fin} n}
+    \left(A_iL_1+\frac12B_iL_2\right)
+  +\frac16 nL_3M_3 .
+\end{aligned}
+\]
+No independence between \(X\) and \(Y\) is assumed in this public statement.
+\end{theorem}
+
+This blueprint tracks how \texttt{Lindeberg/Basic.lean} proves the theorem
+above.  The comparison vector \(Y\) has independent coordinates, while Lean
+removes any auxiliary independence assumption between \(X\) and \(Y\) by
 passing to the product probability space and then transferring the moment
 errors back to the original space.
 
@@ -393,40 +427,7 @@ paper's displayed estimate:
 \end{aligned}
 \]
 \end{theorem}
-
-\begin{theorem}[Theorem 1.1, formalized]\label{thm:theorem-one-one}
-\lean{Lindeberg.theoremOneOne_paper_statement}
-\uses{thm:independent-coupling, lem:product-transfer, lem:error-transfer, lem:third-moment-integrability}
-\leanok
-Let \((\Omega,\mu)\) be a probability space, let
-\(X,Y:\Omega\to(\operatorname{Fin} n\to\mathbb{R})\) have measurable
-coordinates, and assume the \(Y_i\)'s are mutually independent.  Suppose
-\[
-  \int |X_i|^3\,d\mu<\infty,\qquad
-  \int |Y_i|^3\,d\mu<\infty,
-\]
-and
-\[
-  \int |X_i|^3\,d\mu+\int |Y_i|^3\,d\mu\le M_3
-  \quad\text{for every } i.
-\]
-If \(f:\mathbb{R}^n\to\mathbb{R}\) is \(C^3\) and its \(r\)-fold coordinate
-partials satisfy
-\[
-  |\partial_i^r f(x)|\le L_r
-  \qquad (r=1,2,3),
-\]
-then, with \(A_i\) and \(B_i\) defined using the past sigma-algebra generated
-by \(X_j\) for \(j<i\),
-\[
-\begin{aligned}
-  \left|\int_\Omega f(X(\omega))\,d\mu(\omega)
-  -\int_\Omega f(Y(\omega))\,d\mu(\omega)\right|
-  &\le
-  \sum_{i:\operatorname{Fin} n}
-    \left(A_iL_1+\frac12B_iL_2\right)
-  +\frac16 nL_3M_3 .
-\end{aligned}
-\]
-No independence between \(X\) and \(Y\) is assumed in this public statement.
-\end{theorem}
+The public theorem stated at the beginning is obtained by applying this
+engine on \(\Omega\times\Omega\), using \(X\) on the first coordinate and
+\(Y\) on the second, and then rewriting the product-space errors back to the
+original probability space.
