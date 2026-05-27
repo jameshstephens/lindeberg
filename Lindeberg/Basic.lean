@@ -1,0 +1,3877 @@
+/-
+Copyright (c) 2026 James Lindeberg. All rights reserved.
+Released under Apache 2.0 license as described in the file LICENSE.
+Authors: James Lindeberg
+-/
+import Mathlib
+
+/-!
+# Generalized Lindeberg Principle
+
+The public endpoint is `theoremOneOne_paper_statement` at the end of the file.
+The proof is organized in a ladder:
+
+1. deterministic finite-sum estimates;
+2. the Lindeberg interpolation objects and coordinate Taylor remainders;
+3. conditional-expectation and independence identities;
+4. one-step Taylor estimates;
+5. the probabilistic bound with increasingly concrete hypotheses;
+6. the product-coupling reduction that removes the auxiliary independence
+   between `X` and `Y`.
+
+The internal theorem `theoremOneOne_paper_statement_independent_coupling`
+assumes the independent coupling.  The public theorem below constructs that
+coupling on `Ω × Ω`, so its statement has no `hindXY` hypothesis.
+-/
+
+namespace Lindeberg
+
+open MeasureTheory
+open ProbabilityTheory
+
+open scoped BigOperators MeasureTheory
+open scoped Topology
+
+variable {Ω : Type*} [mΩ : MeasurableSpace Ω]
+
+/-! ## Deterministic finite-sum bounds -/
+
+/--
+The per-coordinate bound obtained in the proof of Theorem 1.1 of
+Chatterjee's generalized Lindeberg principle.
+
+The terms `A i` and `B i` stand for the conditional first- and second-moment
+errors, while `L1`, `L2`, `L3`, and `M3` are the derivative and third-moment
+bounds from the paper.
+-/
+noncomputable def coordinateBound {n : Nat} (A B : Fin n -> Real)
+    (L1 L2 L3 M3 : Real) (i : Fin n) : Real :=
+  A i * L1 + (1 / 2 : Real) * B i * L2 + (1 / 6 : Real) * L3 * M3
+
+/-- The right-hand side in the displayed bound of Theorem 1.1. -/
+noncomputable def theoremOneOneBound {n : Nat} (A B : Fin n -> Real)
+    (L1 L2 L3 M3 : Real) : Real :=
+  (Finset.univ.sum fun i : Fin n => A i * L1 + (1 / 2 : Real) * B i * L2) +
+    (n : Real) * L3 * M3 / 6
+
+/--
+The sum of the per-coordinate bounds is the paper's displayed right-hand side.
+-/
+theorem sum_coordinateBound_eq_theoremOneOneBound {n : Nat} (A B : Fin n -> Real)
+    (L1 L2 L3 M3 : Real) :
+    (Finset.univ.sum fun i : Fin n => coordinateBound A B L1 L2 L3 M3 i) =
+      theoremOneOneBound A B L1 L2 L3 M3 := by
+  simp [coordinateBound, theoremOneOneBound, Finset.sum_add_distrib,
+    Finset.sum_const, nsmul_eq_mul]
+  ring
+
+/--
+A deterministic formalization of the concluding estimate in Theorem 1.1.
+
+If the global expectation difference telescopes into coordinate increments, and
+each coordinate increment is bounded by the Taylor/Lindeberg error term, then
+the expectation difference is bounded by the sum appearing in Theorem 1.1.
+-/
+theorem theoremOneOne_deterministic
+    {n : Nat} (efX efY : Real) (increments A B : Fin n -> Real)
+    (L1 L2 L3 M3 : Real)
+    (h_telescopes : efX - efY = Finset.univ.sum increments)
+    (h_step : forall i : Fin n,
+      abs (increments i) <= coordinateBound A B L1 L2 L3 M3 i) :
+    abs (efX - efY) <= theoremOneOneBound A B L1 L2 L3 M3 := by
+  rw [h_telescopes]
+  calc
+    abs (Finset.univ.sum increments)
+        <= Finset.univ.sum (fun i : Fin n => abs (increments i)) := by
+          exact Finset.abs_sum_le_sum_abs increments Finset.univ
+    _ <= Finset.univ.sum (fun i : Fin n =>
+        coordinateBound A B L1 L2 L3 M3 i) := by
+          exact Finset.sum_le_sum (fun i _ => h_step i)
+    _ = theoremOneOneBound A B L1 L2 L3 M3 := by
+          exact sum_coordinateBound_eq_theoremOneOneBound A B L1 L2 L3 M3
+
+/--
+A variant closer to the last line of the informal proof: the third-order
+Taylor contribution may vary by coordinate, provided it is uniformly bounded
+by `M3`.
+-/
+theorem theoremOneOne_deterministic_of_thirdMomentBound
+    {n : Nat} (efX efY : Real) (increments A B third : Fin n -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (hthird : forall i : Fin n, third i <= M3)
+    (h_telescopes : efX - efY = Finset.univ.sum increments)
+    (h_step : forall i : Fin n,
+      abs (increments i) <=
+        A i * L1 + (1 / 2 : Real) * B i * L2 +
+          (1 / 6 : Real) * L3 * third i) :
+    abs (efX - efY) <= theoremOneOneBound A B L1 L2 L3 M3 := by
+  apply theoremOneOne_deterministic efX efY increments A B L1 L2 L3 M3 h_telescopes
+  intro i
+  refine le_trans (h_step i) ?_
+  have hcoef : 0 <= (1 / 6 : Real) * L3 := by positivity
+  have hthird_term :
+      (1 / 6 : Real) * L3 * third i <= (1 / 6 : Real) * L3 * M3 := by
+    exact mul_le_mul_of_nonneg_left (hthird i) hcoef
+  simpa [coordinateBound, add_assoc] using
+    add_le_add_left hthird_term (A i * L1 + (1 / 2 : Real) * B i * L2)
+
+/-! ## Probabilistic quantities -/
+
+/-- Expectation, written as a small wrapper to keep the probabilistic statements readable. -/
+noncomputable def expectation
+    (μ : Measure Ω) (f : Ω -> Real) : Real :=
+  ∫ ω, f ω ∂μ
+
+/-- The `A_i` term in Theorem 1.1, expressed using mathlib's conditional expectation. -/
+noncomputable def firstMomentError {n : Nat}
+    (μ : Measure Ω) (𝓕 : Fin n -> MeasurableSpace Ω)
+    (X Y : Fin n -> Ω -> Real) (i : Fin n) : Real :=
+  ∫ ω, |(condExp (𝓕 i) μ (X i)) ω - ∫ ω, Y i ω ∂μ| ∂μ
+
+/-- The `B_i` term in Theorem 1.1, expressed using mathlib's conditional expectation. -/
+noncomputable def secondMomentError {n : Nat}
+    (μ : Measure Ω) (𝓕 : Fin n -> MeasurableSpace Ω)
+    (X Y : Fin n -> Ω -> Real) (i : Fin n) : Real :=
+  ∫ ω, |(condExp (𝓕 i) μ (fun ω => (X i ω) ^ 2)) ω -
+    ∫ ω, (Y i ω) ^ 2 ∂μ| ∂μ
+
+/--
+The coordinatewise third-moment contribution appearing before it is bounded by
+the uniform constant `M3`.
+-/
+noncomputable def thirdMomentContribution {n : Nat}
+    (μ : Measure Ω) (X Y : Fin n -> Ω -> Real) (i : Fin n) : Real :=
+  (∫ ω, |X i ω| ^ 3 ∂μ) + ∫ ω, |Y i ω| ^ 3 ∂μ
+
+/-- Elementary growth bound used to get first moments from third moments. -/
+theorem abs_le_abs_cube_add_one (a : Real) : |a| <= |a| ^ 3 + 1 := by
+  have h0 : 0 <= |a| := abs_nonneg a
+  by_cases hle : |a| <= 1
+  · have hp : 0 <= |a| ^ 3 := pow_nonneg h0 3
+    nlinarith
+  · have h1 : 1 <= |a| := le_of_not_ge hle
+    have hpow : |a| <= |a| ^ 3 := by
+      nlinarith [h0, h1, sq_nonneg (|a|), mul_nonneg h0 h0]
+    nlinarith
+
+/-- Elementary growth bound used to get second moments from third moments. -/
+theorem abs_sq_le_abs_cube_add_one (a : Real) : |a| ^ 2 <= |a| ^ 3 + 1 := by
+  have h0 : 0 <= |a| := abs_nonneg a
+  by_cases hle : |a| <= 1
+  · have hsq : |a| ^ 2 <= 1 := by nlinarith [sq_nonneg (|a|), hle, h0]
+    nlinarith
+  · have h1 : 1 <= |a| := le_of_not_ge hle
+    have hpow : |a| ^ 2 <= |a| ^ 3 := by
+      nlinarith [h0, h1, sq_nonneg (|a|), mul_nonneg h0 h0]
+    nlinarith
+
+/-- On a finite measure space, a finite third absolute moment implies integrability. -/
+theorem integrable_of_integrable_abs_cube
+    {μ : Measure Ω} [IsFiniteMeasure μ] {x : Ω -> Real}
+    (hx_meas : AEStronglyMeasurable x μ)
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ) :
+    Integrable x μ := by
+  have hbound : ∀ᵐ ω ∂μ, ‖x ω‖ <= |x ω| ^ 3 + 1 :=
+    Filter.Eventually.of_forall fun ω => by
+      simpa [Real.norm_eq_abs] using abs_le_abs_cube_add_one (x ω)
+  exact Integrable.mono' (hx3.add (integrable_const (1 : Real))) hx_meas hbound
+
+/-- On a finite measure space, a finite third absolute moment implies second-moment integrability. -/
+theorem integrable_sq_of_integrable_abs_cube
+    {μ : Measure Ω} [IsFiniteMeasure μ] {x : Ω -> Real}
+    (hx_meas : AEStronglyMeasurable x μ)
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ) :
+    Integrable (fun ω => (x ω) ^ 2) μ := by
+  have hx2_meas : AEStronglyMeasurable (fun ω => (x ω) ^ 2) μ := hx_meas.pow 2
+  have hbound : ∀ᵐ ω ∂μ, ‖(x ω) ^ 2‖ <= |x ω| ^ 3 + 1 :=
+    Filter.Eventually.of_forall fun ω => by
+      rw [Real.norm_eq_abs, abs_pow]
+      exact abs_sq_le_abs_cube_add_one (x ω)
+  exact Integrable.mono' (hx3.add (integrable_const (1 : Real))) hx2_meas hbound
+
+/-! ## Lindeberg interpolation -/
+
+/-- Turn a random vector into its coordinate random variables. -/
+def coordinateProcess {n : Nat} (X : Ω -> Fin n -> Real) : Fin n -> Ω -> Real :=
+  fun i ω => X ω i
+
+/-- The sigma-algebra generated by all coordinates of a random vector. -/
+noncomputable def vectorSigma {n : Nat} (X : Ω -> Fin n -> Real) : MeasurableSpace Ω :=
+  ⨆ j : Fin n, MeasurableSpace.comap (fun ω => X ω j) (borel Real)
+
+/--
+The sigma-algebra generated by the coordinates before `i`.
+
+This is the zero-based Lean version of the paper's sigma-algebra generated by
+`X_1, ..., X_{i-1}`.
+-/
+noncomputable def pastSigma {n : Nat} (X : Ω -> Fin n -> Real) (i : Fin n) :
+    MeasurableSpace Ω :=
+  ⨆ j : {j : Fin n // (j : Nat) < (i : Nat)},
+    MeasurableSpace.comap (fun ω => X ω j.1) (borel Real)
+
+/--
+The sigma-algebra generated by the `Y` coordinates after `i`.
+
+These are the future coordinates appearing in the frozen vector `Z_i^0`.
+-/
+noncomputable def futureSigma {n : Nat} (Y : Ω -> Fin n -> Real) (i : Fin n) :
+    MeasurableSpace Ω :=
+  ⨆ j : {j : Fin n // (i : Nat) < (j : Nat)},
+    MeasurableSpace.comap (fun ω => Y ω j.1) (borel Real)
+
+/--
+The sigma-algebra generated by the variables in the frozen vector `Z_i^0`:
+past `X` coordinates and future `Y` coordinates.
+-/
+noncomputable def frozenSigma {n : Nat}
+    (X Y : Ω -> Fin n -> Real) (i : Fin n) : MeasurableSpace Ω :=
+  pastSigma X i ⊔ futureSigma Y i
+
+theorem pastSigma_le {n : Nat}
+    {X : Ω -> Fin n -> Real} {i : Fin n}
+    (hX : forall j : Fin n, Measurable fun ω => X ω j) :
+    pastSigma X i <= mΩ := by
+  classical
+  rw [pastSigma]
+  exact iSup_le fun j => (hX j.1).comap_le
+
+theorem futureSigma_le {n : Nat}
+    {Y : Ω -> Fin n -> Real} {i : Fin n}
+    (hY : forall j : Fin n, Measurable fun ω => Y ω j) :
+    futureSigma Y i <= mΩ := by
+  classical
+  rw [futureSigma]
+  exact iSup_le fun j => (hY j.1).comap_le
+
+theorem vectorSigma_le {n : Nat}
+    {X : Ω -> Fin n -> Real}
+    (hX : forall j : Fin n, Measurable fun ω => X ω j) :
+    vectorSigma X <= mΩ := by
+  classical
+  rw [vectorSigma]
+  exact iSup_le fun j => (hX j).comap_le
+
+theorem pastSigma_le_vectorSigma {n : Nat}
+    (X : Ω -> Fin n -> Real) (i : Fin n) :
+    pastSigma X i <= vectorSigma X := by
+  classical
+  rw [pastSigma, vectorSigma]
+  exact iSup_le fun j => le_iSup (fun k : Fin n =>
+    MeasurableSpace.comap (fun ω => X ω k) (borel Real)) j.1
+
+theorem futureSigma_le_vectorSigma {n : Nat}
+    (Y : Ω -> Fin n -> Real) (i : Fin n) :
+    futureSigma Y i <= vectorSigma Y := by
+  classical
+  rw [futureSigma, vectorSigma]
+  exact iSup_le fun j => le_iSup (fun k : Fin n =>
+    MeasurableSpace.comap (fun ω => Y ω k) (borel Real)) j.1
+
+theorem coordinate_stronglyMeasurable_vectorSigma {n : Nat}
+    (X : Ω -> Fin n -> Real) (i : Fin n) :
+    StronglyMeasurable[vectorSigma X] (fun ω => X ω i) := by
+  classical
+  have hmeas : @Measurable Ω Real (vectorSigma X) (borel Real) (fun ω => X ω i) :=
+    Measurable.of_comap_le (by
+      rw [vectorSigma]
+      exact le_iSup (fun j : Fin n =>
+        MeasurableSpace.comap (fun ω => X ω j) (borel Real)) i)
+  exact hmeas.stronglyMeasurable
+
+theorem frozenSigma_le {n : Nat}
+    {X Y : Ω -> Fin n -> Real} {i : Fin n}
+    (hX : forall j : Fin n, Measurable fun ω => X ω j)
+    (hY : forall j : Fin n, Measurable fun ω => Y ω j) :
+    frozenSigma X Y i <= mΩ := by
+  exact sup_le (pastSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX)
+    (futureSigma_le (Ω := Ω) (mΩ := mΩ) (Y := Y) hY)
+
+theorem pastSigma_le_frozenSigma {n : Nat}
+    (X Y : Ω -> Fin n -> Real) (i : Fin n) :
+    pastSigma X i <= frozenSigma X Y i := by
+  exact le_sup_left
+
+/--
+The Lindeberg interpolation vector
+`Z_k = (X_0, ..., X_{k-1}, Y_k, ..., Y_{n-1})`.
+
+This is the zero-based Lean version of the paper's
+`Z_i = (X_1, ..., X_i, Y_{i+1}, ..., Y_n)`.
+-/
+noncomputable def lindebergInterpolate {n : Nat}
+    (X Y : Ω -> Fin n -> Real) (k : Nat) (ω : Ω) : Fin n -> Real :=
+  fun j => if (j : Nat) < k then X ω j else Y ω j
+
+@[simp]
+theorem lindebergInterpolate_zero {n : Nat} (X Y : Ω -> Fin n -> Real) (ω : Ω) :
+    lindebergInterpolate X Y 0 ω = Y ω := by
+  ext j
+  simp [lindebergInterpolate]
+
+@[simp]
+theorem lindebergInterpolate_all {n : Nat} (X Y : Ω -> Fin n -> Real) (ω : Ω) :
+    lindebergInterpolate X Y n ω = X ω := by
+  ext j
+  simp [lindebergInterpolate, j.isLt]
+
+theorem lindebergInterpolate_measurable {n : Nat}
+    {X Y : Ω -> Fin n -> Real} (k : Nat)
+    (hX : forall i : Fin n, Measurable fun ω => X ω i)
+    (hY : forall i : Fin n, Measurable fun ω => Y ω i) :
+    Measurable fun ω => lindebergInterpolate X Y k ω := by
+  classical
+  refine measurable_pi_iff.mpr ?_
+  intro i
+  by_cases hi : (i : Nat) < k
+  · simpa [lindebergInterpolate, hi] using hX i
+  · simpa [lindebergInterpolate, hi] using hY i
+
+/--
+The frozen vector `Z_i^0` used in the Taylor expansion at coordinate `i`.
+It agrees with the interpolation just before replacing coordinate `i`, except
+that the `i`th coordinate is set to zero.
+-/
+noncomputable def lindebergFrozen {n : Nat}
+    (X Y : Ω -> Fin n -> Real) (i : Fin n) (ω : Ω) : Fin n -> Real :=
+  fun j => if (j : Nat) < i then X ω j else if j = i then 0 else Y ω j
+
+@[simp]
+theorem lindebergFrozen_self {n : Nat} (X Y : Ω -> Fin n -> Real)
+    (i : Fin n) (ω : Ω) :
+    lindebergFrozen X Y i ω i = 0 := by
+  simp [lindebergFrozen]
+
+/--
+The frozen vector is measurable with respect to the sigma-algebra generated by
+its past `X` coordinates and future `Y` coordinates.
+-/
+theorem lindebergFrozen_measurable_frozenSigma {n : Nat}
+    (X Y : Ω -> Fin n -> Real) (i : Fin n) :
+    @Measurable Ω (Fin n -> Real) (frozenSigma X Y i) (borel (Fin n -> Real))
+      (fun ω => lindebergFrozen X Y i ω) := by
+  classical
+  rw [← BorelSpace.measurable_eq (α := Fin n -> Real)]
+  letI : MeasurableSpace Ω := frozenSigma X Y i
+  change Measurable (fun ω => lindebergFrozen X Y i ω)
+  refine measurable_pi_iff.mpr ?_
+  intro j
+  by_cases hji : j = i
+  · subst j
+    simp [lindebergFrozen]
+  · have hval_ne : (j : Nat) ≠ (i : Nat) := by
+      intro h
+      exact hji (Fin.ext h)
+    by_cases hlt : (j : Nat) < (i : Nat)
+    · have hle : MeasurableSpace.comap (fun ω => X ω j) (borel Real) <=
+          frozenSigma X Y i := by
+        rw [frozenSigma, pastSigma]
+        exact le_trans
+          (le_iSup (fun k : {j : Fin n // (j : Nat) < (i : Nat)} =>
+            MeasurableSpace.comap (fun ω => X ω k.1) (borel Real)) ⟨j, hlt⟩)
+          le_sup_left
+      have hmeas : @Measurable Ω Real (frozenSigma X Y i) (borel Real)
+          (fun ω => X ω j) :=
+        Measurable.of_comap_le hle
+      simpa [lindebergFrozen, hji, hlt] using hmeas
+    · have hgt : (i : Nat) < (j : Nat) := by omega
+      have hle : MeasurableSpace.comap (fun ω => Y ω j) (borel Real) <=
+          frozenSigma X Y i := by
+        rw [frozenSigma, futureSigma]
+        exact le_trans
+          (le_iSup (fun k : {j : Fin n // (i : Nat) < (j : Nat)} =>
+            MeasurableSpace.comap (fun ω => Y ω k.1) (borel Real)) ⟨j, hgt⟩)
+          le_sup_right
+      have hmeas : @Measurable Ω Real (frozenSigma X Y i) (borel Real)
+          (fun ω => Y ω j) :=
+        Measurable.of_comap_le hle
+      simpa [lindebergFrozen, hji, hlt] using hmeas
+
+theorem lindebergInterpolate_eq_update_frozen_self {n : Nat}
+    (X Y : Ω -> Fin n -> Real) (i : Fin n) (ω : Ω) :
+    lindebergInterpolate X Y i ω =
+      Function.update (lindebergFrozen X Y i ω) i (Y ω i) := by
+  classical
+  ext j
+  by_cases hji : j = i
+  · subst j
+    simp [lindebergInterpolate]
+  · by_cases hlt : (j : Nat) < (i : Nat)
+    · simp [lindebergInterpolate, lindebergFrozen, hji, hlt]
+    · simp [lindebergInterpolate, lindebergFrozen, hji, hlt]
+
+theorem lindebergInterpolate_succ_eq_update_frozen {n : Nat}
+    (X Y : Ω -> Fin n -> Real) (i : Fin n) (ω : Ω) :
+    lindebergInterpolate X Y (i + 1) ω =
+      Function.update (lindebergFrozen X Y i ω) i (X ω i) := by
+  classical
+  ext j
+  by_cases hji : j = i
+  · subst j
+    simp [lindebergInterpolate, lindebergFrozen]
+  · have hval_ne : (j : Nat) ≠ (i : Nat) := by
+      intro hval
+      exact hji (Fin.ext hval)
+    by_cases hlt : (j : Nat) < (i : Nat)
+    · have hlt_succ : (j : Nat) < (i : Nat) + 1 := by omega
+      simp [lindebergInterpolate, lindebergFrozen, hji, hlt, hlt_succ]
+    · have hnot_succ : ¬ (j : Nat) < (i : Nat) + 1 := by omega
+      simp [lindebergInterpolate, lindebergFrozen, hji, hlt, hnot_succ]
+
+/-- The one-coordinate slice of a function through a frozen vector. -/
+noncomputable def coordinateSlice {n : Nat}
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n) (t : Real) : Real :=
+  f (Function.update z i t)
+
+/-- A coordinate slice of a `C^k` function is `C^k`. -/
+theorem ContDiff.coordinateSlice {n : Nat} {k : ℕ∞}
+    {f : (Fin n -> Real) -> Real}
+    (hf : ContDiff Real k f) (z : Fin n -> Real) (i : Fin n) :
+    ContDiff Real k (coordinateSlice f z i) := by
+  classical
+  simpa [coordinateSlice, Function.comp_def] using
+    hf.comp (contDiff_update k z i)
+
+/--
+The exact quadratic Taylor residual of a coordinate slice at `0`, for chosen
+first and second derivative values `d1` and `d2`.
+-/
+noncomputable def coordinateTaylorRemainder {n : Nat}
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n)
+    (d1 d2 t : Real) : Real :=
+  coordinateSlice f z i t - coordinateSlice f z i 0 -
+    t * d1 - (1 / 2 : Real) * t ^ 2 * d2
+
+/-- The `r`th ordinary derivative in coordinate `i`, evaluated at `z`. -/
+noncomputable def coordinateDerivative {n : Nat} (r : Nat)
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n) : Real :=
+  iteratedDeriv r (coordinateSlice f z i) 0
+
+/--
+The paper's `∂ᵢ^r f(x)`: the `r`-fold ordinary derivative of `f` in the `i`th
+coordinate, evaluated at the point `x`.
+-/
+noncomputable def coordinatePartialDerivative {n : Nat} (r : Nat)
+    (f : (Fin n -> Real) -> Real) (x : Fin n -> Real) (i : Fin n) : Real :=
+  iteratedDeriv r (coordinateSlice f x i) (x i)
+
+theorem coordinateSlice_update_self {n : Nat} (f : (Fin n -> Real) -> Real)
+    (z : Fin n -> Real) (i : Fin n) (t : Real) :
+    coordinateSlice f (Function.update z i t) i = coordinateSlice f z i := by
+  funext u
+  simp [coordinateSlice]
+
+theorem coordinateDerivative_eq_coordinatePartialDerivative_update_zero {n : Nat} (r : Nat)
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n) :
+    coordinateDerivative r f z i =
+      coordinatePartialDerivative r f (Function.update z i 0) i := by
+  rw [coordinateDerivative, coordinatePartialDerivative]
+  rw [coordinateSlice_update_self]
+  simp
+
+theorem iteratedDeriv_coordinateSlice_eq_coordinatePartialDerivative_update {n : Nat} (r : Nat)
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n) (t : Real) :
+    iteratedDeriv r (coordinateSlice f z i) t =
+      coordinatePartialDerivative r f (Function.update z i t) i := by
+  rw [coordinatePartialDerivative]
+  rw [coordinateSlice_update_self]
+  simp
+
+theorem coordinateDerivative_one_eq_lineDeriv_of_coord_zero {n : Nat}
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n)
+    (hz : z i = 0) :
+    coordinateDerivative 1 f z i = lineDeriv Real f z (Pi.single i 1) := by
+  rw [coordinateDerivative, iteratedDeriv_one, lineDeriv]
+  apply congrArg (fun g : Real -> Real => deriv g 0)
+  funext t
+  dsimp [coordinateSlice]
+  apply congrArg f
+  funext j
+  by_cases hji : j = i
+  · subst j
+    simp [coordinateSlice, hz]
+  · simp [coordinateSlice, Function.update, Pi.single, hji]
+
+theorem deriv_coordinateSlice_eq_lineDeriv_update {n : Nat}
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n) (t : Real)
+    (hf : ContDiff Real 1 f) :
+    deriv (coordinateSlice f z i) t =
+      lineDeriv Real f (Function.update z i t) (Pi.single i 1) := by
+  let e : Fin n -> Real := Pi.single i 1
+  rw [lineDeriv]
+  have hfun :
+      (fun u : Real => f (Function.update z i t + u • e)) =
+        fun u : Real => coordinateSlice f z i (t + u) := by
+    funext u
+    dsimp [coordinateSlice, e]
+    apply congrArg f
+    funext j
+    by_cases hji : j = i
+    · subst j
+      simp [Function.update, Pi.single]
+    · simp [Function.update, Pi.single, hji]
+  rw [hfun]
+  simpa using (deriv_comp_const_add (f := coordinateSlice f z i) (a := t) (x := 0)).symm
+theorem coordinateDerivative_two_eq_lineDeriv_lineDeriv_of_coord_zero {n : Nat}
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n)
+    (hz : z i = 0) (hf : ContDiff Real 2 f) :
+    coordinateDerivative 2 f z i =
+      lineDeriv Real (fun x : Fin n -> Real =>
+        lineDeriv Real f x (Pi.single i 1)) z (Pi.single i 1) := by
+  let e : Fin n -> Real := Pi.single i 1
+  rw [coordinateDerivative]
+  change iteratedDeriv (1 + 1) (coordinateSlice f z i) 0 =
+    lineDeriv Real (fun x : Fin n -> Real => lineDeriv Real f x e) z e
+  rw [iteratedDeriv_succ, iteratedDeriv_one, lineDeriv]
+  apply congrArg (fun g : Real -> Real => deriv g 0)
+  funext t
+  rw [deriv_coordinateSlice_eq_lineDeriv_update
+    (f := f) (z := z) (i := i) (t := t) (hf.of_le (by norm_num))]
+  apply congrArg (fun x : Fin n -> Real => lineDeriv Real f x e)
+  funext j
+  by_cases hji : j = i
+  · subst j
+    simp [e, hz]
+  · simp [e, Function.update, Pi.single, hji]
+
+/-- The paper's frozen coordinate derivative factor in the `i`th Lindeberg step. -/
+noncomputable def frozenCoordinateDerivative {n : Nat} (r : Nat)
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (i : Fin n) (ω : Ω) : Real :=
+  coordinateDerivative r f (lindebergFrozen X Y i ω) i
+
+theorem frozenCoordinateDerivative_one_stronglyMeasurable {n : Nat}
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real) (i : Fin n)
+    (hf : ContDiff Real 1 f) :
+    StronglyMeasurable[frozenSigma X Y i] (frozenCoordinateDerivative 1 f X Y i) := by
+  classical
+  let e : Fin n -> Real := Pi.single i 1
+  have hline : StronglyMeasurable (fun z : Fin n -> Real => lineDeriv Real f z e) :=
+    stronglyMeasurable_lineDeriv (𝕜 := Real) (E := Fin n -> Real) (F := Real)
+      (v := e) hf.continuous
+  have hcomp :
+      StronglyMeasurable[frozenSigma X Y i]
+        (fun ω => lineDeriv Real f (lindebergFrozen X Y i ω) e) := by
+    have hmeas :
+        @Measurable Ω (Fin n -> Real) (frozenSigma X Y i) MeasurableSpace.pi
+          (fun ω => lindebergFrozen X Y i ω) := by
+      exact (lindebergFrozen_measurable_frozenSigma X Y i).mono le_rfl pi_le_borel_pi
+    simpa [Function.comp_def] using
+      hline.comp_measurable hmeas
+  have hEq :
+      (fun ω => lineDeriv Real f (lindebergFrozen X Y i ω) e) =
+        frozenCoordinateDerivative 1 f X Y i := by
+    funext ω
+    simp only [frozenCoordinateDerivative]
+    exact (coordinateDerivative_one_eq_lineDeriv_of_coord_zero
+      (f := f) (z := lindebergFrozen X Y i ω) (i := i)
+      (lindebergFrozen_self X Y i ω)).symm
+  simpa [hEq] using hcomp
+theorem frozenCoordinateDerivative_two_stronglyMeasurable {n : Nat}
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real) (i : Fin n)
+    (hf : ContDiff Real 2 f) :
+    StronglyMeasurable[frozenSigma X Y i] (frozenCoordinateDerivative 2 f X Y i) := by
+  classical
+  let e : Fin n -> Real := Pi.single i 1
+  let g : (Fin n -> Real) -> Real := fun x => lineDeriv Real f x e
+  have hg_cont : Continuous g := by
+    have hfd_cont : Continuous fun x : Fin n -> Real => fderiv Real f x e :=
+      (hf.continuous_fderiv (by norm_num)).clm_apply continuous_const
+    have hEq : g = fun x : Fin n -> Real => fderiv Real f x e := by
+      funext x
+      exact (hf.differentiable (by norm_num) x).lineDeriv_eq_fderiv
+    rw [hEq]
+    exact hfd_cont
+  have hline : StronglyMeasurable (fun z : Fin n -> Real => lineDeriv Real g z e) :=
+    stronglyMeasurable_lineDeriv (𝕜 := Real) (E := Fin n -> Real) (F := Real)
+      (v := e) hg_cont
+  have hcomp :
+      StronglyMeasurable[frozenSigma X Y i]
+        (fun ω => lineDeriv Real g (lindebergFrozen X Y i ω) e) := by
+    have hmeas :
+        @Measurable Ω (Fin n -> Real) (frozenSigma X Y i) MeasurableSpace.pi
+          (fun ω => lindebergFrozen X Y i ω) := by
+      exact (lindebergFrozen_measurable_frozenSigma X Y i).mono le_rfl pi_le_borel_pi
+    simpa [Function.comp_def] using
+      hline.comp_measurable hmeas
+  have hEq :
+      (fun ω => lineDeriv Real g (lindebergFrozen X Y i ω) e) =
+        frozenCoordinateDerivative 2 f X Y i := by
+    funext ω
+    simp only [frozenCoordinateDerivative, g]
+    exact (coordinateDerivative_two_eq_lineDeriv_lineDeriv_of_coord_zero
+      (f := f) (z := lindebergFrozen X Y i ω) (i := i)
+      (lindebergFrozen_self X Y i ω) hf).symm
+  simpa [hEq] using hcomp
+theorem lindeberg_step_eq_coordinateTaylorRemainders {n : Nat}
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 : Fin n -> Ω -> Real) (i : Fin n) (ω : Ω) :
+    f (lindebergInterpolate X Y (i + 1) ω) -
+        f (lindebergInterpolate X Y i ω) =
+      (X ω i * D1 i ω - Y ω i * D1 i ω) +
+        (1 / 2 : Real) * ((X ω i) ^ 2 * D2 i ω - (Y ω i) ^ 2 * D2 i ω) +
+          (coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+              (D1 i ω) (D2 i ω) (X ω i) -
+            coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+              (D1 i ω) (D2 i ω) (Y ω i)) := by
+  rw [lindebergInterpolate_succ_eq_update_frozen,
+    lindebergInterpolate_eq_update_frozen_self]
+  simp [coordinateTaylorRemainder, coordinateSlice]
+  ring
+
+/--
+The same algebraic Taylor-step identity as an almost-everywhere statement,
+ready to pass to the integral estimate.
+-/
+theorem lindeberg_step_ae_eq_coordinateTaylorRemainders {n : Nat}
+    (μ : Measure Ω) (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 : Fin n -> Ω -> Real) (i : Fin n) :
+    (fun ω =>
+        f (lindebergInterpolate X Y (i + 1) ω) -
+          f (lindebergInterpolate X Y i ω)) =ᵐ[μ]
+      fun ω =>
+        (X ω i * D1 i ω - Y ω i * D1 i ω) +
+          (1 / 2 : Real) * ((X ω i) ^ 2 * D2 i ω - (Y ω i) ^ 2 * D2 i ω) +
+    (coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+                (D1 i ω) (D2 i ω) (X ω i) -
+              coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+                (D1 i ω) (D2 i ω) (Y ω i)) :=
+  Filter.Eventually.of_forall
+    (lindeberg_step_eq_coordinateTaylorRemainders f X Y D1 D2 i)
+
+theorem lindeberg_integral_telescope {n : Nat}
+    (μ : Measure Ω) (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (hInt : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ) :
+    (∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ =
+      Finset.univ.sum (fun i : Fin n =>
+        ∫ ω,
+          f (lindebergInterpolate X Y (i + 1) ω) -
+            f (lindebergInterpolate X Y i ω) ∂μ) := by
+  let g : Nat -> Ω -> Real := fun k ω => f (lindebergInterpolate X Y k ω)
+  have htelescope :=
+    Finset.sum_range_sub (fun k => ∫ ω, g k ω ∂μ) n
+  calc
+    (∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ =
+        (∫ ω, g n ω ∂μ) - ∫ ω, g 0 ω ∂μ := by
+          simp [g]
+    _ = Finset.sum (Finset.range n)
+        (fun k => (∫ ω, g (k + 1) ω ∂μ) - ∫ ω, g k ω ∂μ) := htelescope.symm
+    _ = Finset.sum (Finset.range n) (fun k => ∫ ω, g (k + 1) ω - g k ω ∂μ) := by
+          refine Finset.sum_congr rfl ?_
+          intro k hk
+          have hk_lt : k < n := Finset.mem_range.mp hk
+          have hk_succ : k + 1 <= n := Nat.succ_le_of_lt hk_lt
+          have hk_le : k <= n := Nat.le_trans (Nat.le_succ k) hk_succ
+          exact (integral_sub' (hInt (k + 1) hk_succ) (hInt k hk_le)).symm
+    _ = Finset.univ.sum (fun i : Fin n =>
+        ∫ ω,
+          f (lindebergInterpolate X Y (i + 1) ω) -
+            f (lindebergInterpolate X Y i ω) ∂μ) := by
+          rw [Finset.sum_fin_eq_sum_range]
+          refine Finset.sum_congr rfl ?_
+          intro k hk
+          simp [g, Finset.mem_range.mp hk]
+theorem abs_integral_mul_le_integral_abs_mul_bound
+    {μ : Measure Ω}
+    {a d : Ω -> Real} {L : Real}
+    (ha : Integrable (fun ω => |a ω|) μ)
+    (hd : ∀ᵐ ω ∂μ, |d ω| <= L) :
+    |∫ ω, a ω * d ω ∂μ| <= (∫ ω, |a ω| ∂μ) * L := by
+  have hbound : ∀ᵐ ω ∂μ, ‖a ω * d ω‖ <= |a ω| * L := by
+    filter_upwards [hd] with ω hω
+    calc
+      ‖a ω * d ω‖ = |a ω| * |d ω| := by
+        simp [Real.norm_eq_abs, abs_mul]
+      _ <= |a ω| * L := by
+        exact mul_le_mul_of_nonneg_left hω (abs_nonneg _)
+  have hle := norm_integral_le_of_norm_le (ha.mul_const L) hbound
+  simpa [Real.norm_eq_abs, integral_mul_const] using hle
+
+/--
+Pull an `𝓕`-measurable multiplier through conditional expectation.
+
+This is the formal version of the identity
+`E[a d] = E[E[a | 𝓕] d]`.
+-/
+theorem integral_mul_eq_integral_condExp_mul
+    {μ : Measure Ω} {𝓕 : MeasurableSpace Ω} (h𝓕 : 𝓕 <= mΩ)
+    [SigmaFinite (μ.trim h𝓕)] {a d : Ω -> Real}
+    (hd : StronglyMeasurable[𝓕] d)
+    (ha : Integrable a μ)
+    (had : Integrable (fun ω => d ω * a ω) μ) :
+    ∫ ω, a ω * d ω ∂μ =
+      ∫ ω, (condExp 𝓕 μ a) ω * d ω ∂μ := by
+  calc
+    ∫ ω, a ω * d ω ∂μ = ∫ ω, d ω * a ω ∂μ := by
+      simp_rw [mul_comm]
+    _ = ∫ ω, (condExp 𝓕 μ (fun ω => d ω * a ω)) ω ∂μ := by
+      exact (integral_condExp h𝓕).symm
+    _ = ∫ ω, d ω * (condExp 𝓕 μ a) ω ∂μ := by
+      exact integral_congr_ae (condExp_mul_of_stronglyMeasurable_left hd had ha)
+    _ = ∫ ω, (condExp 𝓕 μ a) ω * d ω ∂μ := by
+      simp_rw [mul_comm]
+theorem integral_sub_mul_eq_condExp_sub_integral_mul
+    {μ : Measure Ω} {𝓕 : MeasurableSpace Ω} (h𝓕 : 𝓕 <= mΩ)
+    [SigmaFinite (μ.trim h𝓕)] {x y d : Ω -> Real}
+    (hd𝓕 : StronglyMeasurable[𝓕] d)
+    (hx : Integrable x μ)
+    (hxd : Integrable (fun ω => x ω * d ω) μ)
+    (hyd : Integrable (fun ω => y ω * d ω) μ)
+    (hcond_d : Integrable (fun ω => (condExp 𝓕 μ x) ω * d ω) μ)
+    (hconst_d : Integrable (fun ω => (∫ ν, y ν ∂μ) * d ω) μ)
+    (hy_ae : AEStronglyMeasurable[mΩ] y μ)
+    (hd_ae : AEStronglyMeasurable[mΩ] d μ)
+    (hind : IndepFun y d μ) :
+    (∫ ω, x ω * d ω - y ω * d ω ∂μ) =
+      ∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d ω ∂μ := by
+  have hpull :
+      ∫ ω, x ω * d ω ∂μ =
+        ∫ ω, (condExp 𝓕 μ x) ω * d ω ∂μ := by
+    exact integral_mul_eq_integral_condExp_mul
+      (Ω := Ω) (mΩ := mΩ) h𝓕 hd𝓕 hx (by simpa [mul_comm] using hxd)
+  have hind_int :
+      ∫ ω, y ω * d ω ∂μ = (∫ ω, y ω ∂μ) * ∫ ω, d ω ∂μ :=
+    hind.integral_fun_mul_eq_mul_integral hy_ae hd_ae
+  calc
+    (∫ ω, x ω * d ω - y ω * d ω ∂μ)
+        = (∫ ω, x ω * d ω ∂μ) - ∫ ω, y ω * d ω ∂μ := by
+          exact integral_sub' hxd hyd
+    _ = (∫ ω, (condExp 𝓕 μ x) ω * d ω ∂μ) -
+        (∫ ω, y ω ∂μ) * ∫ ω, d ω ∂μ := by
+          rw [hpull, hind_int]
+    _ = (∫ ω, (condExp 𝓕 μ x) ω * d ω ∂μ) -
+        ∫ ω, (∫ ν, y ν ∂μ) * d ω ∂μ := by
+          rw [integral_const_mul]
+    _ = ∫ ω,
+        (condExp 𝓕 μ x) ω * d ω - (∫ ν, y ν ∂μ) * d ω ∂μ := by
+          exact (integral_sub' hcond_d hconst_d).symm
+    _ = ∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d ω ∂μ := by
+          congr 1
+          ext ω
+          ring
+theorem integral_mul_eq_integral_ae_condExp_mul
+    {μ : Measure Ω} {𝓖 : MeasurableSpace Ω} (h𝓖 : 𝓖 <= mΩ)
+    [SigmaFinite (μ.trim h𝓖)] {a d c : Ω -> Real}
+    (hd𝓖 : StronglyMeasurable[𝓖] d)
+    (ha : Integrable a μ)
+    (had : Integrable (fun ω => d ω * a ω) μ)
+    (hc : (condExp 𝓖 μ a) =ᵐ[μ] c) :
+    ∫ ω, a ω * d ω ∂μ = ∫ ω, c ω * d ω ∂μ := by
+  calc
+    ∫ ω, a ω * d ω ∂μ =
+        ∫ ω, (condExp 𝓖 μ a) ω * d ω ∂μ := by
+          exact integral_mul_eq_integral_condExp_mul
+            (Ω := Ω) (mΩ := mΩ) h𝓖 hd𝓖 ha had
+    _ = ∫ ω, c ω * d ω ∂μ := by
+          exact integral_congr_ae (hc.mono fun ω hω => by
+            simpa using congrArg (fun z => z * d ω) hω)
+
+/--
+The linear conditional-expectation identity with a larger frozen sigma-algebra.
+
+The hypothesis `hcond` is the precise remaining probabilistic assertion:
+conditioning `x` on the larger sigma-algebra `𝓖` gives the same a.e. result as
+the function `cx` (in applications, `cx = E[x | past]`).  This lets the
+multiplier `d` depend on future independent variables while keeping the error
+term expressed using the paper's past conditional expectation.
+-/
+theorem integral_sub_mul_eq_ae_condExp_sub_integral_mul
+    {μ : Measure Ω} {𝓖 : MeasurableSpace Ω} (h𝓖 : 𝓖 <= mΩ)
+    [SigmaFinite (μ.trim h𝓖)] {x y d cx : Ω -> Real}
+    (hd𝓖 : StronglyMeasurable[𝓖] d)
+    (hx : Integrable x μ)
+    (hxd : Integrable (fun ω => x ω * d ω) μ)
+    (hyd : Integrable (fun ω => y ω * d ω) μ)
+    (hcx_d : Integrable (fun ω => cx ω * d ω) μ)
+    (hconst_d : Integrable (fun ω => (∫ ν, y ν ∂μ) * d ω) μ)
+    (hy_ae : AEStronglyMeasurable[mΩ] y μ)
+    (hd_ae : AEStronglyMeasurable[mΩ] d μ)
+    (hind : IndepFun y d μ)
+    (hcond : (condExp 𝓖 μ x) =ᵐ[μ] cx) :
+    (∫ ω, x ω * d ω - y ω * d ω ∂μ) =
+      ∫ ω, (cx ω - ∫ ν, y ν ∂μ) * d ω ∂μ := by
+  have hpull :
+      ∫ ω, x ω * d ω ∂μ = ∫ ω, cx ω * d ω ∂μ := by
+    exact integral_mul_eq_integral_ae_condExp_mul
+      (Ω := Ω) (mΩ := mΩ) h𝓖 hd𝓖 hx (by simpa [mul_comm] using hxd) hcond
+  have hind_int :
+      ∫ ω, y ω * d ω ∂μ = (∫ ω, y ω ∂μ) * ∫ ω, d ω ∂μ :=
+    hind.integral_fun_mul_eq_mul_integral hy_ae hd_ae
+  calc
+    (∫ ω, x ω * d ω - y ω * d ω ∂μ)
+        = (∫ ω, x ω * d ω ∂μ) - ∫ ω, y ω * d ω ∂μ := by
+          exact integral_sub' hxd hyd
+    _ = (∫ ω, cx ω * d ω ∂μ) - (∫ ω, y ω ∂μ) * ∫ ω, d ω ∂μ := by
+          rw [hpull, hind_int]
+    _ = (∫ ω, cx ω * d ω ∂μ) - ∫ ω, (∫ ν, y ν ∂μ) * d ω ∂μ := by
+          rw [integral_const_mul]
+    _ = ∫ ω, cx ω * d ω - (∫ ν, y ν ∂μ) * d ω ∂μ := by
+          exact (integral_sub' hcx_d hconst_d).symm
+    _ = ∫ ω, (cx ω - ∫ ν, y ν ∂μ) * d ω ∂μ := by
+          congr 1
+          ext ω
+          ring
+theorem indepFun_of_indep_comap_of_stronglyMeasurable_right
+    {μ : Measure Ω} {𝓖 : MeasurableSpace Ω} {y d : Ω -> Real}
+    (hind : Indep (MeasurableSpace.comap y (borel Real)) 𝓖 μ)
+    (hd : StronglyMeasurable[𝓖] d) :
+    IndepFun y d μ := by
+  rw [IndepFun_iff_Indep]
+  exact indep_of_indep_of_le_right hind hd.measurable.comap_le
+
+/--
+If `y` is independent of `𝓖`, then `y^2` is independent of every real-valued
+`𝓖`-measurable function.
+-/
+theorem indepFun_sq_of_indep_comap_of_stronglyMeasurable_right
+    {μ : Measure Ω} {𝓖 : MeasurableSpace Ω} {y d : Ω -> Real}
+    (hind : Indep (MeasurableSpace.comap y (borel Real)) 𝓖 μ)
+    (hd : StronglyMeasurable[𝓖] d) :
+    IndepFun (fun ω => (y ω) ^ 2) d μ := by
+  have hsq : Measurable fun x : Real => x ^ 2 := measurable_id.pow_const 2
+  simpa [Function.comp_def] using
+    (indepFun_of_indep_comap_of_stronglyMeasurable_right
+      (Ω := Ω) (mΩ := mΩ) hind hd).comp hsq measurable_id
+
+/--
+If each `Y_i` is independent of the frozen sigma-algebra used in the `i`th
+Lindeberg step, then the linear and quadratic `Y` terms are independent of the
+corresponding frozen derivative factors.
+-/
+theorem y_frozen_derivative_indepFun_of_indep_frozen {n : Nat}
+    {μ : Measure Ω} {X Y : Ω -> Fin n -> Real} {D1 D2 : Fin n -> Ω -> Real}
+    (hy_indep_frozen : forall i : Fin n,
+      Indep (MeasurableSpace.comap (fun ω => Y ω i) (borel Real)) (frozenSigma X Y i) μ)
+    (hd1_frozen : forall i : Fin n, StronglyMeasurable[frozenSigma X Y i] (D1 i))
+    (hd2_frozen : forall i : Fin n, StronglyMeasurable[frozenSigma X Y i] (D2 i)) :
+    (forall i : Fin n, IndepFun (fun ω => Y ω i) (D1 i) μ) ∧
+      (forall i : Fin n, IndepFun (fun ω => (Y ω i) ^ 2) (D2 i) μ) := by
+  constructor
+  · intro i
+    exact indepFun_of_indep_comap_of_stronglyMeasurable_right
+      (Ω := Ω) (mΩ := mΩ) (hy_indep_frozen i) (hd1_frozen i)
+  · intro i
+    exact indepFun_sq_of_indep_comap_of_stronglyMeasurable_right
+      (Ω := Ω) (mΩ := mΩ) (hy_indep_frozen i) (hd2_frozen i)
+
+/-- Rectangles `A ∩ B` with `A` measurable in `𝓐` and `B` measurable in `𝓑`. -/
+def measurableRectangles (𝓐 𝓑 : MeasurableSpace Ω) : Set (Set Ω) :=
+  {s | ∃ A B : Set Ω, MeasurableSet[𝓐] A ∧ MeasurableSet[𝓑] B ∧ A ∩ B = s}
+
+theorem isPiSystem_measurableRectangles (𝓐 𝓑 : MeasurableSpace Ω) :
+    IsPiSystem (measurableRectangles (Ω := Ω) 𝓐 𝓑) := by
+  rintro _ ⟨A1, B1, hA1, hB1, rfl⟩ _ ⟨A2, B2, hA2, hB2, rfl⟩ _
+  refine ⟨A1 ∩ A2, B1 ∩ B2, hA1.inter hA2, hB1.inter hB2, ?_⟩
+  ext ω
+  simp [and_assoc, and_left_comm, and_comm]
+
+theorem generateFrom_measurableRectangles_eq_sup (𝓐 𝓑 : MeasurableSpace Ω) :
+    MeasurableSpace.generateFrom (measurableRectangles (Ω := Ω) 𝓐 𝓑) = 𝓐 ⊔ 𝓑 := by
+  apply le_antisymm
+  · refine MeasurableSpace.generateFrom_le ?_
+    rintro s ⟨A, B, hA, hB, rfl⟩
+    exact ((le_sup_left : 𝓐 ≤ 𝓐 ⊔ 𝓑) A hA).inter
+      ((le_sup_right : 𝓑 ≤ 𝓐 ⊔ 𝓑) B hB)
+  · refine sup_le ?_ ?_
+    · intro A hA
+      exact MeasurableSpace.measurableSet_generateFrom
+        ⟨A, Set.univ, hA, MeasurableSet.univ, by simp⟩
+    · intro B hB
+      exact MeasurableSpace.measurableSet_generateFrom
+        ⟨Set.univ, B, MeasurableSet.univ, hB, by simp⟩
+
+/--
+If the coordinates of `Y` are mutually independent, then the current coordinate
+is independent of the future `Y` coordinates used in the frozen vector.
+-/
+theorem y_coord_indep_futureSigma_of_iIndep {n : Nat}
+    {μ : Measure Ω} [IsProbabilityMeasure μ]
+    {Y : Ω -> Fin n -> Real} (i : Fin n)
+    (hY_meas : forall j : Fin n, Measurable fun ω => Y ω j)
+    (hY_indep : iIndep (fun j : Fin n =>
+      MeasurableSpace.comap (fun ω => Y ω j) (borel Real)) μ) :
+    Indep (MeasurableSpace.comap (fun ω => Y ω i) (borel Real)) (futureSigma Y i) μ := by
+  classical
+  let m : Fin n -> MeasurableSpace Ω := fun j =>
+    MeasurableSpace.comap (fun ω => Y ω j) (borel Real)
+  have hle : forall j : Fin n, m j <= mΩ := fun j => (hY_meas j).comap_le
+  have hind : Indep (⨆ j ∈ ({i} : Set (Fin n)), m j)
+      (⨆ j ∈ {j : Fin n | (i : Nat) < (j : Nat)}, m j) μ :=
+    indep_iSup_of_disjoint (μ := μ) hle (by simpa [m] using hY_indep) (by
+      rw [Set.disjoint_left]
+      intro x hx hx'
+      simp at hx
+      subst hx
+      exact Nat.lt_irrefl _ hx')
+  simpa [futureSigma, m, iSup_subtype'] using hind
+
+/--
+If `𝓐` is independent of `𝓕`, and `𝓧` is independent of the joint
+sigma-algebra `𝓐 ⊔ 𝓕`, then `𝓐` is independent of `𝓧 ⊔ 𝓕`.
+
+This is the small pi-system argument needed to combine the paper's independence
+of `X` from the whole `Y` vector with coordinatewise independence inside `Y`.
+-/
+theorem indep_left_sup_of_indep_left_right
+    {μ : Measure Ω} [IsProbabilityMeasure μ]
+    {𝓐 𝓧 𝓕 : MeasurableSpace Ω}
+    (h𝓐 : 𝓐 <= mΩ) (h𝓧 : 𝓧 <= mΩ) (h𝓕 : 𝓕 <= mΩ)
+    (hAF : Indep 𝓐 𝓕 μ)
+    (hXAF : Indep 𝓧 (𝓐 ⊔ 𝓕) μ) :
+    Indep 𝓐 (𝓧 ⊔ 𝓕) μ := by
+  have hXF : Indep 𝓧 𝓕 μ :=
+    indep_of_indep_of_le_right hXAF le_sup_right
+  refine IndepSets.indep h𝓐 (sup_le h𝓧 h𝓕)
+    (@MeasurableSpace.isPiSystem_measurableSet Ω 𝓐)
+    (isPiSystem_measurableRectangles (Ω := Ω) 𝓧 𝓕)
+    (@MeasurableSpace.generateFrom_measurableSet Ω 𝓐).symm
+    (generateFrom_measurableRectangles_eq_sup (Ω := Ω) 𝓧 𝓕).symm ?_
+  rw [IndepSets_iff]
+  intro A D hA hD
+  rcases hD with ⟨B, C, hB, hC, rfl⟩
+  have hA_sup : @MeasurableSet Ω (𝓐 ⊔ 𝓕) A :=
+    (le_sup_left : 𝓐 ≤ 𝓐 ⊔ 𝓕) A hA
+  have hC_sup : @MeasurableSet Ω (𝓐 ⊔ 𝓕) C :=
+    (le_sup_right : 𝓕 ≤ 𝓐 ⊔ 𝓕) C hC
+  have hAC_sup : @MeasurableSet Ω (𝓐 ⊔ 𝓕) (A ∩ C) := hA_sup.inter hC_sup
+  have hBΩ : @MeasurableSet Ω mΩ B := h𝓧 B hB
+  have hCΩ : @MeasurableSet Ω mΩ C := h𝓕 C hC
+  have hAΩ : @MeasurableSet Ω mΩ A := h𝓐 A hA
+  have hXAF_set := hXAF.indepSet_of_measurableSet hB hAC_sup
+  have hAF_set := hAF.indepSet_of_measurableSet hA hC
+  have hXF_set := hXF.indepSet_of_measurableSet hB hC
+  rw [indepSet_iff_measure_inter_eq_mul hBΩ ((sup_le h𝓐 h𝓕) (A ∩ C) hAC_sup) μ] at hXAF_set
+  rw [indepSet_iff_measure_inter_eq_mul hAΩ hCΩ μ] at hAF_set
+  rw [indepSet_iff_measure_inter_eq_mul hBΩ hCΩ μ] at hXF_set
+  calc
+    μ (A ∩ (B ∩ C)) = μ (B ∩ (A ∩ C)) := by
+      congr 1
+      ext ω
+      simp [and_assoc, and_left_comm, and_comm]
+    _ = μ B * μ (A ∩ C) := hXAF_set
+    _ = μ B * (μ A * μ C) := by rw [hAF_set]
+    _ = μ A * (μ B * μ C) := by ac_rfl
+    _ = μ A * μ (B ∩ C) := by rw [hXF_set]
+
+/--
+The paper's independence hypotheses imply that `Y_i` is independent of the
+frozen variables at the `i`th Lindeberg step.
+-/
+theorem y_coord_indep_frozenSigma_of_indep_vectors_iIndep {n : Nat}
+    {μ : Measure Ω} [IsProbabilityMeasure μ]
+    {X Y : Ω -> Fin n -> Real} (i : Fin n)
+    (hX_meas : forall j : Fin n, Measurable fun ω => X ω j)
+    (hY_meas : forall j : Fin n, Measurable fun ω => Y ω j)
+    (hindXY : Indep (vectorSigma X) (vectorSigma Y) μ)
+    (hY_indep : iIndep (fun j : Fin n =>
+      MeasurableSpace.comap (fun ω => Y ω j) (borel Real)) μ) :
+    Indep (MeasurableSpace.comap (fun ω => Y ω i) (borel Real))
+      (frozenSigma X Y i) μ := by
+  classical
+  let 𝓐 : MeasurableSpace Ω :=
+    MeasurableSpace.comap (fun ω => Y ω i) (borel Real)
+  let 𝓧 : MeasurableSpace Ω := pastSigma X i
+  let 𝓕 : MeasurableSpace Ω := futureSigma Y i
+  have h𝓐 : 𝓐 <= mΩ := by
+    dsimp [𝓐]
+    exact (hY_meas i).comap_le
+  have h𝓧 : 𝓧 <= mΩ := by
+    dsimp [𝓧]
+    exact pastSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+  have h𝓕 : 𝓕 <= mΩ := by
+    dsimp [𝓕]
+    exact futureSigma_le (Ω := Ω) (mΩ := mΩ) (Y := Y) hY_meas
+  have hAF : Indep 𝓐 𝓕 μ := by
+    dsimp [𝓐, 𝓕]
+    exact y_coord_indep_futureSigma_of_iIndep
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (Y := Y) i hY_meas hY_indep
+  have h𝓐_vector : 𝓐 <= vectorSigma Y := by
+    dsimp [𝓐]
+    rw [vectorSigma]
+    exact le_iSup (fun j : Fin n =>
+      MeasurableSpace.comap (fun ω => Y ω j) (borel Real)) i
+  have h𝓕_vector : 𝓕 <= vectorSigma Y := by
+    dsimp [𝓕]
+    exact futureSigma_le_vectorSigma Y i
+  have hXAF : Indep 𝓧 (𝓐 ⊔ 𝓕) μ := by
+    have hpastXY : Indep 𝓧 (vectorSigma Y) μ :=
+      indep_of_indep_of_le_left hindXY (by
+        dsimp [𝓧]
+        exact pastSigma_le_vectorSigma X i)
+    exact indep_of_indep_of_le_right hpastXY (sup_le h𝓐_vector h𝓕_vector)
+  have hmain : Indep 𝓐 (𝓧 ⊔ 𝓕) μ :=
+    indep_left_sup_of_indep_left_right
+      (Ω := Ω) (mΩ := mΩ) (μ := μ)
+      (𝓐 := 𝓐) (𝓧 := 𝓧) (𝓕 := 𝓕) h𝓐 h𝓧 h𝓕 hAF hXAF
+  simpa [frozenSigma, 𝓐, 𝓧, 𝓕] using hmain
+
+/-- Independence of sigma-algebras gives independence of measurable real functions. -/
+theorem indepFun_of_indep_of_stronglyMeasurable
+    {μ : Measure Ω} {𝓐 𝓑 : MeasurableSpace Ω} {f g : Ω -> Real}
+    (hind : Indep 𝓐 𝓑 μ)
+    (hf : StronglyMeasurable[𝓐] f)
+    (hg : StronglyMeasurable[𝓑] g) :
+    IndepFun f g μ := by
+  rw [IndepFun_iff_Indep]
+  exact indep_of_indep_of_le_right
+    (indep_of_indep_of_le_left hind hf.measurable.comap_le)
+    hg.measurable.comap_le
+
+/--
+If a real random variable is measurable with respect to a sigma-algebra
+independent of `𝓑`, then integrating it over a rectangle `A ∩ B` factors in the
+`B` coordinate.
+-/
+theorem integral_inter_eq_measure_mul_integral_of_indep
+    {μ : Measure Ω} {𝓧 𝓑 : MeasurableSpace Ω}
+    (h𝓧 : 𝓧 <= mΩ) (h𝓑 : 𝓑 <= mΩ)
+    (hind : Indep 𝓧 𝓑 μ) {u : Ω -> Real}
+    (hu : StronglyMeasurable[𝓧] u)
+    {A B : Set Ω} (hA : MeasurableSet[𝓧] A) (hB : MeasurableSet[𝓑] B) :
+    ∫ ω in A ∩ B, u ω ∂μ = (μ B).toReal * ∫ ω in A, u ω ∂μ := by
+  have hAΩ : @MeasurableSet Ω mΩ A := h𝓧 A hA
+  have hBΩ : @MeasurableSet Ω mΩ B := h𝓑 B hB
+  have hBone : StronglyMeasurable[𝓑] (B.indicator fun _ : Ω => (1 : Real)) :=
+    (@stronglyMeasurable_const Ω Real 𝓑 _ (1 : Real)).indicator hB
+  have hIndFun :
+      IndepFun (A.indicator u) (B.indicator fun _ : Ω => (1 : Real)) μ :=
+    indepFun_of_indep_of_stronglyMeasurable
+      (Ω := Ω) (mΩ := mΩ) hind (hu.indicator hA) hBone
+  have hmul := hIndFun.integral_fun_mul_eq_mul_integral
+    ((hu.indicator hA).mono h𝓧).aestronglyMeasurable
+    (hBone.mono h𝓑).aestronglyMeasurable
+  have hpoint :
+      (fun ω => (A ∩ B).indicator u ω) =
+        fun ω => A.indicator u ω * B.indicator (fun _ : Ω => (1 : Real)) ω := by
+    ext ω
+    by_cases hAω : ω ∈ A <;> by_cases hBω : ω ∈ B <;> simp [hAω, hBω]
+  calc
+    ∫ ω in A ∩ B, u ω ∂μ =
+        ∫ ω, (A ∩ B).indicator u ω ∂μ := by
+          exact (@integral_indicator Ω Real mΩ _ _ u (A ∩ B) μ
+            (hAΩ.inter hBΩ)).symm
+    _ = ∫ ω, A.indicator u ω * B.indicator (fun _ : Ω => (1 : Real)) ω ∂μ := by
+          rw [hpoint]
+    _ = (∫ ω, A.indicator u ω ∂μ) *
+          ∫ ω, B.indicator (fun _ : Ω => (1 : Real)) ω ∂μ := hmul
+    _ = (∫ ω in A, u ω ∂μ) * (μ B).toReal := by
+          rw [@integral_indicator Ω Real mΩ _ _ u A μ hAΩ]
+          have hBint :
+              ∫ ω, B.indicator (fun _ : Ω => (1 : Real)) ω ∂μ = (μ B).toReal := by
+            simpa using (@integral_indicator_one Ω mΩ μ B hBΩ)
+          rw [hBint]
+    _ = (μ B).toReal * ∫ ω in A, u ω ∂μ := by ring
+theorem condExp_sup_indep_eq_condExp_left
+    {μ : Measure Ω} {𝓟 𝓧 𝓕 : MeasurableSpace Ω}
+    (h𝓟 : 𝓟 <= mΩ) (h𝓧 : 𝓧 <= mΩ) (h𝓕 : 𝓕 <= mΩ)
+    [SigmaFinite (μ.trim h𝓟)] [SigmaFinite (μ.trim (sup_le h𝓟 h𝓕))]
+    (h𝓟𝓧 : 𝓟 <= 𝓧) {x : Ω -> Real}
+    (hx_meas : StronglyMeasurable[𝓧] x)
+    (hx : Integrable x μ)
+    (hind : Indep 𝓧 𝓕 μ) :
+    (condExp (𝓟 ⊔ 𝓕) μ x) =ᵐ[μ]
+      condExp 𝓟 μ x := by
+  let 𝓒 : MeasurableSpace Ω := 𝓟 ⊔ 𝓕
+  let c : Ω -> Real := condExp 𝓟 μ x
+  have h𝓒 : 𝓒 <= mΩ := by
+    dsimp [𝓒]
+    exact sup_le h𝓟 h𝓕
+  have h𝓟𝓒 : 𝓟 <= 𝓒 := by
+    dsimp [𝓒]
+    exact le_sup_left
+  have hc𝓟 : StronglyMeasurable[𝓟] c := by
+    dsimp [c]
+    exact stronglyMeasurable_condExp
+  have hc𝓧 : StronglyMeasurable[𝓧] c := hc𝓟.mono h𝓟𝓧
+  have hc𝓒 : StronglyMeasurable[𝓒] c := hc𝓟.mono h𝓟𝓒
+  have hc_int : Integrable c μ := by
+    dsimp [c]
+    exact integrable_condExp
+  have h_rect_eq : 𝓒 = MeasurableSpace.generateFrom
+      (measurableRectangles (Ω := Ω) 𝓟 𝓕) := by
+    dsimp [𝓒]
+    exact (generateFrom_measurableRectangles_eq_sup (Ω := Ω) 𝓟 𝓕).symm
+  let setInt (s : Set Ω) (u : Ω -> Real) : Real :=
+    @integral Ω Real _ _ mΩ (μ.restrict s) u
+  have h_sets : forall ⦃s : Set Ω⦄, MeasurableSet[𝓒] s ->
+      setInt s c = setInt s x := by
+    let C : forall s : Set Ω, MeasurableSet[𝓒] s -> Prop :=
+      fun s _ => setInt s c = setInt s x
+    change forall ⦃s : Set Ω⦄ (hs : MeasurableSet[𝓒] s), C s hs
+    refine MeasurableSpace.induction_on_inter
+      (C := C)
+      (m := 𝓒) (s := measurableRectangles (Ω := Ω) 𝓟 𝓕)
+      h_rect_eq (isPiSystem_measurableRectangles (Ω := Ω) 𝓟 𝓕) ?_ ?_ ?_ ?_
+    · dsimp [C, setInt]
+      simp
+    · rintro _ ⟨A, B, hA, hB, rfl⟩
+      dsimp [C, setInt]
+      change ∫ ω in A ∩ B, c ω ∂μ = ∫ ω in A ∩ B, x ω ∂μ
+      have hA𝓧 : MeasurableSet[𝓧] A := h𝓟𝓧 A hA
+      have hx_rect :
+          ∫ ω in A ∩ B, x ω ∂μ =
+            (μ B).toReal * ∫ ω in A, x ω ∂μ :=
+        integral_inter_eq_measure_mul_integral_of_indep
+          (Ω := Ω) (mΩ := mΩ) h𝓧 h𝓕 hind hx_meas hA𝓧 hB
+      have hc_rect :
+          ∫ ω in A ∩ B, c ω ∂μ =
+            (μ B).toReal * ∫ ω in A, c ω ∂μ :=
+        integral_inter_eq_measure_mul_integral_of_indep
+          (Ω := Ω) (mΩ := mΩ) h𝓧 h𝓕 hind hc𝓧 hA𝓧 hB
+      have hcondA : ∫ ω in A, c ω ∂μ = ∫ ω in A, x ω ∂μ := by
+        dsimp [c]
+        exact setIntegral_condExp h𝓟 hx hA
+      calc
+        ∫ ω in A ∩ B, c ω ∂μ =
+            (μ B).toReal * ∫ ω in A, c ω ∂μ := hc_rect
+        _ = (μ B).toReal * ∫ ω in A, x ω ∂μ := by rw [hcondA]
+        _ = ∫ ω in A ∩ B, x ω ∂μ := hx_rect.symm
+    · intro t ht hct
+      dsimp [C, setInt] at hct ⊢
+      change ∫ ω in tᶜ, c ω ∂μ = ∫ ω in tᶜ, x ω ∂μ
+      have htΩ : @MeasurableSet Ω mΩ t := h𝓒 t ht
+      have htotal : ∫ ω, c ω ∂μ = ∫ ω, x ω ∂μ := by
+        dsimp [c]
+        exact integral_condExp h𝓟
+      have hc_add :
+          ∫ ω in t, c ω ∂μ + ∫ ω in tᶜ, c ω ∂μ = ∫ ω, c ω ∂μ :=
+        integral_add_compl htΩ hc_int
+      have hx_add :
+          ∫ ω in t, x ω ∂μ + ∫ ω in tᶜ, x ω ∂μ = ∫ ω, x ω ∂μ :=
+        integral_add_compl htΩ hx
+      linarith
+    · intro f hdisj hf_meas hf_eq
+      dsimp [C, setInt] at hf_eq ⊢
+      change
+        @integral Ω Real _ _ mΩ (μ.restrict (⋃ i, f i)) c =
+          @integral Ω Real _ _ mΩ (μ.restrict (⋃ i, f i)) x
+      have hf_eq' : forall i,
+          @integral Ω Real _ _ mΩ (μ.restrict (f i)) c =
+            @integral Ω Real _ _ mΩ (μ.restrict (f i)) x := by
+        intro i
+        simpa [setInt] using hf_eq i
+      have hfΩ : forall i, @MeasurableSet Ω mΩ (f i) :=
+        fun i => h𝓒 (f i) (hf_meas i)
+      rw [integral_iUnion (μ := μ) (s := f) (f := c) hfΩ hdisj hc_int.integrableOn,
+        integral_iUnion (μ := μ) (s := f) (f := x) hfΩ hdisj hx.integrableOn]
+      exact tsum_congr fun i => hf_eq' i
+  have hc_eq :
+      c =ᵐ[μ] condExp 𝓒 μ x :=
+    ae_eq_condExp_of_forall_setIntegral_eq h𝓒 hx
+      (fun s _ _ => hc_int.integrableOn)
+      (fun s hs _ => by simpa [setInt] using h_sets hs)
+      hc𝓒.aestronglyMeasurable
+  simpa [𝓒, c] using hc_eq.symm
+theorem condExp_frozenSigma_eq_pastSigma_of_indep_vectors {n : Nat}
+    {μ : Measure Ω} [IsFiniteMeasure μ]
+    {X Y : Ω -> Fin n -> Real} (i : Fin n)
+    (hX_meas : forall j : Fin n, Measurable fun ω => X ω j)
+    (hY_meas : forall j : Fin n, Measurable fun ω => Y ω j)
+    (hindXY : Indep (vectorSigma X) (vectorSigma Y) μ)
+    (hx : Integrable (fun ω => X ω i) μ) :
+    (condExp (frozenSigma X Y i) μ (fun ω => X ω i)) =ᵐ[μ]
+      condExp (pastSigma X i) μ (fun ω => X ω i) := by
+  have hPast : pastSigma X i <= mΩ :=
+    pastSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+  have hFuture : futureSigma Y i <= mΩ :=
+    futureSigma_le (Ω := Ω) (mΩ := mΩ) (Y := Y) hY_meas
+  have hVectorX : vectorSigma X <= mΩ :=
+    vectorSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+  have hPastVector : pastSigma X i <= vectorSigma X :=
+    pastSigma_le_vectorSigma X i
+  have hFutureVector : futureSigma Y i <= vectorSigma Y :=
+    futureSigma_le_vectorSigma Y i
+  have hindFuture : Indep (vectorSigma X) (futureSigma Y i) μ :=
+    indep_of_indep_of_le_right hindXY hFutureVector
+  letI : SigmaFinite (μ.trim hPast) := inferInstance
+  letI : SigmaFinite (μ.trim (sup_le hPast hFuture)) := inferInstance
+  simpa [frozenSigma] using
+    condExp_sup_indep_eq_condExp_left
+      (Ω := Ω) (mΩ := mΩ) (μ := μ)
+      (𝓟 := pastSigma X i) (𝓧 := vectorSigma X) (𝓕 := futureSigma Y i)
+      hPast hVectorX hFuture hPastVector
+      (coordinate_stronglyMeasurable_vectorSigma X i) hx hindFuture
+
+/--
+The quadratic version of `condExp_frozenSigma_eq_pastSigma_of_indep_vectors`.
+-/
+theorem condExp_frozenSigma_sq_eq_pastSigma_of_indep_vectors {n : Nat}
+    {μ : Measure Ω} [IsFiniteMeasure μ]
+    {X Y : Ω -> Fin n -> Real} (i : Fin n)
+    (hX_meas : forall j : Fin n, Measurable fun ω => X ω j)
+    (hY_meas : forall j : Fin n, Measurable fun ω => Y ω j)
+    (hindXY : Indep (vectorSigma X) (vectorSigma Y) μ)
+    (hx2 : Integrable (fun ω => (X ω i) ^ 2) μ) :
+    (condExp (frozenSigma X Y i) μ (fun ω => (X ω i) ^ 2)) =ᵐ[μ]
+      condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2) := by
+  have hPast : pastSigma X i <= mΩ :=
+    pastSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+  have hFuture : futureSigma Y i <= mΩ :=
+    futureSigma_le (Ω := Ω) (mΩ := mΩ) (Y := Y) hY_meas
+  have hVectorX : vectorSigma X <= mΩ :=
+    vectorSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+  have hPastVector : pastSigma X i <= vectorSigma X :=
+    pastSigma_le_vectorSigma X i
+  have hFutureVector : futureSigma Y i <= vectorSigma Y :=
+    futureSigma_le_vectorSigma Y i
+  have hindFuture : Indep (vectorSigma X) (futureSigma Y i) μ :=
+    indep_of_indep_of_le_right hindXY hFutureVector
+  have hx2_meas : StronglyMeasurable[vectorSigma X] (fun ω => (X ω i) ^ 2) :=
+    (coordinate_stronglyMeasurable_vectorSigma X i).pow 2
+  letI : SigmaFinite (μ.trim hPast) := inferInstance
+  letI : SigmaFinite (μ.trim (sup_le hPast hFuture)) := inferInstance
+  simpa [frozenSigma] using
+    condExp_sup_indep_eq_condExp_left
+      (Ω := Ω) (mΩ := mΩ) (μ := μ)
+      (𝓟 := pastSigma X i) (𝓧 := vectorSigma X) (𝓕 := futureSigma Y i)
+      hPast hVectorX hFuture hPastVector hx2_meas hx2 hindFuture
+
+/--
+An independence criterion for identifying an enlarged conditional expectation.
+
+If `c` is already `𝓖`-measurable and the centered residual `x - c` is
+measurable with respect to a sigma-algebra independent of `𝓖` with mean zero,
+then `E[x | 𝓖] = c` a.e.  This packages a common way to discharge the
+`hcond` hypotheses in the enlarged one-step theorem.
+-/
+theorem condExp_eq_of_indep_sub_integral_zero
+    {μ : Measure Ω} {𝓖 𝓗 : MeasurableSpace Ω}
+    (h𝓖 : 𝓖 <= mΩ) (h𝓗 : 𝓗 <= mΩ)
+    [SigmaFinite (μ.trim h𝓖)] {x c : Ω -> Real}
+    (hxc𝓗 : StronglyMeasurable[𝓗] (fun ω => x ω - c ω))
+    (hc𝓖 : StronglyMeasurable[𝓖] c)
+    (hx : Integrable x μ)
+    (hc : Integrable c μ)
+    (hind : Indep 𝓗 𝓖 μ)
+    (hmean : ∫ ω, x ω - c ω ∂μ = 0) :
+    (condExp 𝓖 μ x) =ᵐ[μ] c := by
+  have h_ind :
+      (condExp 𝓖 μ (fun ω => x ω - c ω)) =ᵐ[μ]
+        fun _ => ∫ ω, x ω - c ω ∂μ :=
+    condExp_indep_eq (μ := μ) (m₁ := 𝓗) (m₂ := 𝓖) (m := mΩ)
+      h𝓗 h𝓖 hxc𝓗 hind
+  have h_zero :
+      (condExp 𝓖 μ (fun ω => x ω - c ω)) =ᵐ[μ]
+        fun _ => 0 := by
+    exact h_ind.mono fun ω hω => by simpa [hmean] using hω
+  have h_sub :
+      (condExp 𝓖 μ (fun ω => x ω - c ω)) =ᵐ[μ]
+        fun ω => (condExp 𝓖 μ x) ω - (condExp 𝓖 μ c) ω :=
+    condExp_sub (μ := μ) hx hc 𝓖
+  have h_c :
+      (condExp 𝓖 μ c) = c :=
+    condExp_of_stronglyMeasurable h𝓖 hc𝓖 hc
+  filter_upwards [h_sub, h_zero] with ω hsubω hzeroω
+  rw [h_c] at hsubω
+  linarith
+theorem integral_sub_condExp_eq_zero
+    {μ : Measure Ω} {𝓕 : MeasurableSpace Ω} (h𝓕 : 𝓕 <= mΩ)
+    [SigmaFinite (μ.trim h𝓕)] {x : Ω -> Real}
+    (hx : Integrable x μ) :
+    ∫ ω, x ω - (condExp 𝓕 μ x) ω ∂μ = 0 := by
+  calc
+    ∫ ω, x ω - (condExp 𝓕 μ x) ω ∂μ =
+        (∫ ω, x ω ∂μ) - ∫ ω, (condExp 𝓕 μ x) ω ∂μ := by
+          simpa only [Pi.sub_apply] using
+            integral_sub' hx (integrable_condExp (μ := μ) (m := 𝓕) (f := x))
+    _ = 0 := by
+          rw [integral_condExp h𝓕]
+          ring
+theorem condExp_eq_condExp_of_indep_sub_condExp
+    {μ : Measure Ω} {𝓕 𝓖 𝓗 : MeasurableSpace Ω}
+    (h𝓕 : 𝓕 <= mΩ) (h𝓕𝓖 : 𝓕 <= 𝓖) (h𝓖 : 𝓖 <= mΩ) (h𝓗 : 𝓗 <= mΩ)
+    [SigmaFinite (μ.trim h𝓕)] [SigmaFinite (μ.trim h𝓖)]
+    {x : Ω -> Real}
+    (hres𝓗 : StronglyMeasurable[𝓗]
+      (fun ω => x ω - (condExp 𝓕 μ x) ω))
+    (hx : Integrable x μ)
+    (hind : Indep 𝓗 𝓖 μ) :
+    (condExp 𝓖 μ x) =ᵐ[μ]
+      condExp 𝓕 μ x := by
+  exact condExp_eq_of_indep_sub_integral_zero
+    (Ω := Ω) (mΩ := mΩ) (μ := μ) (𝓖 := 𝓖) (𝓗 := 𝓗)
+    h𝓖 h𝓗 hres𝓗
+    (stronglyMeasurable_condExp.mono h𝓕𝓖)
+    hx (integrable_condExp (μ := μ) (m := 𝓕) (f := x))
+    hind (integral_sub_condExp_eq_zero (Ω := Ω) (mΩ := mΩ) h𝓕 hx)
+theorem taylorWithinEval_two_zero
+    (g : Real -> Real) (s : Set Real) (x : Real) :
+    taylorWithinEval g 2 s 0 x =
+      g 0 + x * iteratedDerivWithin 1 g s 0 +
+        (1 / 2 : Real) * x ^ 2 * iteratedDerivWithin 2 g s 0 := by
+  rw [taylor_within_apply]
+  norm_num [Finset.sum_range_succ, Nat.factorial]
+
+/--
+The coordinate residual with derivative values supplied by
+`iteratedDerivWithin` is exactly the Taylor remainder.
+-/
+theorem coordinateTaylorRemainder_eq_taylorWithin {n : Nat}
+    (f : (Fin n -> Real) -> Real) (z : Fin n -> Real) (i : Fin n)
+    (s : Set Real) (x : Real) :
+    coordinateTaylorRemainder f z i
+        (iteratedDerivWithin 1 (coordinateSlice f z i) s 0)
+        (iteratedDerivWithin 2 (coordinateSlice f z i) s 0) x =
+      coordinateSlice f z i x -
+        taylorWithinEval (coordinateSlice f z i) 2 s 0 x := by
+  rw [taylorWithinEval_two_zero]
+  simp [coordinateTaylorRemainder]
+  ring
+
+/--
+One-dimensional Taylor's theorem with the sharp third-order Lagrange remainder
+constant, stated in the form used for a single coordinate replacement when the
+coordinate displacement is nonnegative.
+
+The fully coordinatewise theorem needs this lemma in both orientations of the
+line segment; this is the positive-orientation form supplied directly by
+mathlib's `taylor_mean_remainder_lagrange`.
+-/
+theorem oneDim_taylorWithin_remainder_bound_of_pos
+    {g : Real -> Real} {x L3 : Real}
+    (hx : 0 < x)
+    (hg : ContDiffOn Real 3 g (Set.Icc 0 x))
+    (hC : forall y, y ∈ Set.Icc 0 x ->
+      ‖iteratedDerivWithin 3 g (Set.Icc 0 x) y‖ <= L3) :
+    |g x - taylorWithinEval g 2 (Set.Icc 0 x) 0 x| <=
+      (1 / 6 : Real) * L3 * |x| ^ 3 := by
+  have hf2Icc : ContDiffOn Real 2 g (Set.Icc 0 x) := by
+    exact hg.of_le (by norm_num)
+  have hf2 : ContDiffOn Real 2 g (Set.uIcc 0 x) := by
+    simpa [Set.uIcc_of_le hx.le] using hf2Icc
+  have hdiffIoo :
+      DifferentiableOn Real (iteratedDerivWithin 2 g (Set.Icc 0 x)) (Set.Ioo 0 x) := by
+    exact
+      (hg.differentiableOn_iteratedDerivWithin
+        (by norm_num) (uniqueDiffOn_Icc hx)).mono Set.Ioo_subset_Icc_self
+  have hdiff :
+      DifferentiableOn Real (iteratedDerivWithin 2 g (Set.uIcc 0 x)) (Set.uIoo 0 x) := by
+    simpa [Set.uIcc_of_le hx.le, Set.uIoo_of_le hx.le] using hdiffIoo
+  rcases taylor_mean_remainder_lagrange (f := g) (x := x) (x₀ := 0) (n := 2)
+      (ne_of_lt hx) hf2 hdiff with ⟨y, hy, hrem⟩
+  rw [Set.uIcc_of_le hx.le] at hrem
+  rw [Set.uIoo_of_le hx.le] at hy
+  have hyIcc : y ∈ Set.Icc 0 x := ⟨hy.1.le, hy.2.le⟩
+  have hbound : |iteratedDerivWithin 3 g (Set.Icc 0 x) y| <= L3 := by
+    simpa [Real.norm_eq_abs] using hC y hyIcc
+  rw [hrem]
+  norm_num
+  have hcoef : 0 <= |x| ^ 3 / 6 := by positivity
+  calc
+    |iteratedDerivWithin 3 g (Set.Icc 0 x) y * x ^ 3 / 6| =
+        |iteratedDerivWithin 3 g (Set.Icc 0 x) y| * (|x| ^ 3 / 6) := by
+          norm_num [abs_mul, abs_div, abs_pow]
+          ring
+    _ <= L3 * (|x| ^ 3 / 6) := by
+          exact mul_le_mul_of_nonneg_right hbound hcoef
+    _ = (1 / 6 : Real) * L3 * |x| ^ 3 := by
+          ring
+theorem coordinateTaylorRemainder_bound_of_pos {n : Nat}
+    {f : (Fin n -> Real) -> Real} {z : Fin n -> Real} {i : Fin n}
+    {x L3 : Real}
+    (hx : 0 < x)
+    (hg : ContDiffOn Real 3 (coordinateSlice f z i) (Set.Icc 0 x))
+    (hC : forall y, y ∈ Set.Icc 0 x ->
+      ‖iteratedDerivWithin 3 (coordinateSlice f z i) (Set.Icc 0 x) y‖ <= L3) :
+    |coordinateTaylorRemainder f z i
+        (iteratedDerivWithin 1 (coordinateSlice f z i) (Set.Icc 0 x) 0)
+        (iteratedDerivWithin 2 (coordinateSlice f z i) (Set.Icc 0 x) 0) x| <=
+      (1 / 6 : Real) * L3 * |x| ^ 3 := by
+  rw [coordinateTaylorRemainder_eq_taylorWithin]
+  exact oneDim_taylorWithin_remainder_bound_of_pos hx hg hC
+theorem iteratedDerivWithin_one_Icc_zero_eq_iteratedDeriv
+    {g : Real -> Real} {x : Real} (hx : 0 < x)
+    (hg : ContDiff Real 3 g) :
+    iteratedDerivWithin 1 g (Set.Icc 0 x) 0 = iteratedDeriv 1 g 0 := by
+  have hUD : UniqueDiffWithinAt Real (Set.Icc 0 x) 0 :=
+    uniqueDiffOn_Icc hx 0 (Set.left_mem_Icc.mpr hx.le)
+  rw [iteratedDerivWithin_one, iteratedDeriv_one]
+  exact (hg.differentiable (by norm_num) 0).derivWithin hUD
+theorem iteratedDerivWithin_two_Icc_zero_eq_iteratedDeriv
+    {g : Real -> Real} {x : Real} (hx : 0 < x)
+    (hg : ContDiff Real 3 g) :
+    iteratedDerivWithin 2 g (Set.Icc 0 x) 0 = iteratedDeriv 2 g 0 := by
+  let s : Set Real := Set.Icc 0 x
+  have hUD : UniqueDiffWithinAt Real s 0 :=
+    uniqueDiffOn_Icc hx 0 (Set.left_mem_Icc.mpr hx.le)
+  have hU : UniqueDiffOn Real s := uniqueDiffOn_Icc hx
+  have hEq1 : Set.EqOn (iteratedDerivWithin 1 g s) (iteratedDeriv 1 g) s := by
+    intro y hy
+    have hUDy : UniqueDiffWithinAt Real s y := hU y hy
+    rw [iteratedDerivWithin_one, iteratedDeriv_one]
+    exact (hg.differentiable (by norm_num) y).derivWithin hUDy
+  rw [show (2 : Nat) = 1 + 1 by norm_num]
+  rw [iteratedDerivWithin_succ, iteratedDeriv_succ]
+  rw [derivWithin_congr hEq1 (hEq1 (Set.left_mem_Icc.mpr hx.le))]
+  exact
+    ((hg.differentiable_iteratedDeriv 1 (by norm_num)) 0).derivWithin hUD
+theorem iteratedDerivWithin_three_Icc_eq_iteratedDeriv_of_mem_Ioo
+    {g : Real -> Real} {x y : Real} (_hx : 0 < x)
+    (hy : y ∈ Set.Ioo 0 x) :
+    iteratedDerivWithin 3 g (Set.Icc 0 x) y = iteratedDeriv 3 g y := by
+  have hsets : Set.Icc 0 x =ᶠ[𝓝 y] Set.univ := by
+    filter_upwards [isOpen_Ioo.mem_nhds hy] with z hz
+    apply propext
+    constructor
+    · intro _
+      trivial
+    · intro _
+      exact ⟨hz.1.le, hz.2.le⟩
+  have hF := iteratedFDerivWithin_congr_set (𝕜 := Real) (f := g)
+    (s := Set.Icc 0 x) (t := Set.univ) hsets 3
+  rw [iteratedDerivWithin_eq_iteratedFDerivWithin, iteratedDeriv_eq_iteratedFDeriv]
+  rw [hF]
+  rw [iteratedFDerivWithin_univ]
+theorem oneDim_taylor_remainder_bound_of_pos
+    {g : Real -> Real} {x L3 : Real}
+    (hx : 0 < x)
+    (hg : ContDiff Real 3 g)
+    (hC : forall y, |iteratedDeriv 3 g y| <= L3) :
+    |g x - g 0 - x * iteratedDeriv 1 g 0 -
+        (1 / 2 : Real) * x ^ 2 * iteratedDeriv 2 g 0| <=
+      (1 / 6 : Real) * L3 * |x| ^ 3 := by
+  have hf3 : ContDiffOn Real (2 + 1 : Nat) g (Set.uIcc 0 x) := by
+    simpa [Set.uIcc_of_le hx.le] using
+      (hg.contDiffOn : ContDiffOn Real 3 g (Set.Icc 0 x))
+  rcases taylor_mean_remainder_lagrange_iteratedDeriv
+      (f := g) (x := x) (x₀ := 0) (n := 2) (ne_of_lt hx) hf3 with
+    ⟨y, hy, hrem⟩
+  have hpoly :
+      taylorWithinEval g 2 (Set.uIcc 0 x) 0 x =
+        g 0 + x * iteratedDeriv 1 g 0 +
+          (1 / 2 : Real) * x ^ 2 * iteratedDeriv 2 g 0 := by
+    rw [Set.uIcc_of_le hx.le, taylorWithinEval_two_zero]
+    rw [iteratedDerivWithin_one_Icc_zero_eq_iteratedDeriv hx hg]
+    rw [iteratedDerivWithin_two_Icc_zero_eq_iteratedDeriv hx hg]
+  have hbound : |iteratedDeriv (2 + 1) g y| <= L3 := by
+    simpa using hC y
+  have hmain :
+      |g x - taylorWithinEval g 2 (Set.uIcc 0 x) 0 x| <=
+        (1 / 6 : Real) * L3 * |x| ^ 3 := by
+    rw [hrem]
+    norm_num
+    have hcoef : 0 <= |x| ^ 3 / 6 := by positivity
+    calc
+      |iteratedDeriv 3 g y * x ^ 3 / 6| =
+          |iteratedDeriv 3 g y| * (|x| ^ 3 / 6) := by
+            norm_num [abs_mul, abs_div, abs_pow]
+            ring
+      _ <= L3 * (|x| ^ 3 / 6) := by
+            exact mul_le_mul_of_nonneg_right hbound hcoef
+      _ = (1 / 6 : Real) * L3 * |x| ^ 3 := by
+            ring
+  convert hmain using 1
+  rw [hpoly]
+  ring_nf
+theorem oneDim_taylor_remainder_bound
+    {g : Real -> Real} {L3 : Real}
+    (hg : ContDiff Real 3 g)
+    (hC : forall y, |iteratedDeriv 3 g y| <= L3) (x : Real) :
+    |g x - g 0 - x * iteratedDeriv 1 g 0 -
+        (1 / 2 : Real) * x ^ 2 * iteratedDeriv 2 g 0| <=
+      (1 / 6 : Real) * L3 * |x| ^ 3 := by
+  rcases lt_trichotomy x 0 with hxneg | rfl | hxpos
+  · let h : Real -> Real := fun u => g (-u)
+    have hu : 0 < -x := by linarith
+    have hh : ContDiff Real 3 h := by
+      dsimp [h]
+      exact hg.comp contDiff_neg
+    have hCneg : forall y, |iteratedDeriv 3 h y| <= L3 := by
+      intro y
+      dsimp [h]
+      rw [iteratedDeriv_comp_neg]
+      norm_num
+      exact hC (-y)
+    have hpos := oneDim_taylor_remainder_bound_of_pos (g := h) (x := -x)
+      (L3 := L3) hu hh hCneg
+    dsimp [h] at hpos
+    rw [iteratedDeriv_comp_neg] at hpos
+    rw [iteratedDeriv_comp_neg] at hpos
+    norm_num at hpos
+    simpa [iteratedDeriv_one] using hpos
+  · simp
+  · exact oneDim_taylor_remainder_bound_of_pos (g := g) (x := x)
+      (L3 := L3) hxpos hg hC
+theorem coordinateTaylorRemainder_bound {n : Nat}
+    {f : (Fin n -> Real) -> Real} {z : Fin n -> Real} {i : Fin n}
+    {x L3 : Real}
+    (hf : ContDiff Real 3 f)
+    (hC : forall (z : Fin n -> Real) (i : Fin n) (t : Real),
+      |iteratedDeriv 3 (coordinateSlice f z i) t| <= L3) :
+    |coordinateTaylorRemainder f z i
+        (iteratedDeriv 1 (coordinateSlice f z i) 0)
+        (iteratedDeriv 2 (coordinateSlice f z i) 0) x| <=
+      (1 / 6 : Real) * L3 * |x| ^ 3 := by
+  simpa [coordinateTaylorRemainder] using
+    oneDim_taylor_remainder_bound
+      (g := coordinateSlice f z i) (L3 := L3)
+      (ContDiff.coordinateSlice hf z i) (fun y => hC z i y) x
+theorem coordinateTaylorRemainder_integrable_of_bound {n : Nat}
+    {μ : Measure Ω} {f : (Fin n -> Real) -> Real} {Z : Ω -> Fin n -> Real}
+    {x : Ω -> Real} {i : Fin n} {L3 : Real}
+    (hf : ContDiff Real 3 f)
+    (hD3_bound : forall (z : Fin n -> Real) (i : Fin n) (t : Real),
+      |iteratedDeriv 3 (coordinateSlice f z i) t| <= L3)
+    (hZ_meas : Measurable Z)
+    (hZ_i : forall ω, Z ω i = 0)
+    (hx_meas : Measurable x)
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ)
+    (hd1_ae : AEStronglyMeasurable (fun ω => coordinateDerivative 1 f (Z ω) i) μ)
+    (hd2_ae : AEStronglyMeasurable (fun ω => coordinateDerivative 2 f (Z ω) i) μ) :
+    Integrable
+      (fun ω =>
+        coordinateTaylorRemainder f (Z ω) i
+          (coordinateDerivative 1 f (Z ω) i)
+          (coordinateDerivative 2 f (Z ω) i) (x ω)) μ := by
+  have hupdate_meas : Measurable fun ω => Function.update (Z ω) i (x ω) := by
+    refine measurable_pi_iff.mpr ?_
+    intro j
+    by_cases hji : j = i
+    · subst j
+      simpa [Function.update] using hx_meas
+    · simpa [Function.update, hji] using (measurable_pi_apply j).comp hZ_meas
+  have hfx : AEStronglyMeasurable
+      (fun ω => coordinateSlice f (Z ω) i (x ω)) μ := by
+    exact (hf.continuous.measurable.comp hupdate_meas).aestronglyMeasurable
+  have hf0 : AEStronglyMeasurable
+      (fun ω => coordinateSlice f (Z ω) i 0) μ := by
+    have hfZ : AEStronglyMeasurable (fun ω => f (Z ω)) μ :=
+      (hf.continuous.measurable.comp hZ_meas).aestronglyMeasurable
+    have hEq : (fun ω => coordinateSlice f (Z ω) i 0) = fun ω => f (Z ω) := by
+      funext ω
+      have hupdate0 : Function.update (Z ω) i 0 = Z ω := by
+        rw [Function.update_eq_self_iff]
+        exact (hZ_i ω).symm
+      simp [coordinateSlice, hupdate0]
+    simpa [hEq] using hfZ
+  have hx_ae : AEStronglyMeasurable x μ := hx_meas.aestronglyMeasurable
+  have hterm1 : AEStronglyMeasurable
+      (fun ω => x ω * coordinateDerivative 1 f (Z ω) i) μ :=
+    hx_ae.mul hd1_ae
+  have hterm2 : AEStronglyMeasurable
+      (fun ω => (1 / 2 : Real) * x ω ^ 2 * coordinateDerivative 2 f (Z ω) i) μ := by
+    simpa [mul_assoc] using ((hx_ae.pow 2).mul hd2_ae).const_mul (1 / 2 : Real)
+  have hr_ae : AEStronglyMeasurable
+      (fun ω =>
+        coordinateTaylorRemainder f (Z ω) i
+          (coordinateDerivative 1 f (Z ω) i)
+          (coordinateDerivative 2 f (Z ω) i) (x ω)) μ := by
+    simpa [coordinateTaylorRemainder] using
+      (((hfx.sub hf0).sub hterm1).sub hterm2)
+  have hdom : Integrable (fun ω => (1 / 6 : Real) * L3 * |x ω| ^ 3) μ :=
+    hx3.const_mul ((1 / 6 : Real) * L3)
+  have hbound : ∀ᵐ ω ∂μ,
+      ‖coordinateTaylorRemainder f (Z ω) i
+          (coordinateDerivative 1 f (Z ω) i)
+          (coordinateDerivative 2 f (Z ω) i) (x ω)‖ <=
+        (1 / 6 : Real) * L3 * |x ω| ^ 3 := by
+    exact Filter.Eventually.of_forall fun ω => by
+      simpa [Real.norm_eq_abs, coordinateDerivative] using
+        coordinateTaylorRemainder_bound
+          (f := f) (z := Z ω) (i := i) (x := x ω) (L3 := L3) hf hD3_bound
+  exact hdom.mono' hr_ae hbound
+
+theorem coordinateSlice_abs_sub_zero_le {n : Nat}
+    {f : (Fin n -> Real) -> Real} {L1 : Real}
+    (hf : ContDiff Real 1 f)
+    (hL1_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 1 f x i| <= L1)
+    (z : Fin n -> Real) (i : Fin n) (x : Real) :
+    |coordinateSlice f z i x - coordinateSlice f z i 0| <= L1 * |x| := by
+  let g : Real -> Real := coordinateSlice f z i
+  have hg : ContDiff Real 1 g := ContDiff.coordinateSlice hf z i
+  have hderiv_bound : forall y : Real, |deriv g y| <= L1 := by
+    intro y
+    have h := hL1_bound i (Function.update z i y)
+    simpa [g, iteratedDeriv_one,
+      ← iteratedDeriv_coordinateSlice_eq_coordinatePartialDerivative_update
+        (r := 1) (f := f) (z := z) (i := i) (t := y)] using h
+  by_cases hx0 : 0 <= x
+  · have hhas : forall y, y ∈ Set.Icc 0 x ->
+        HasDerivWithinAt g (deriv g y) (Set.Icc 0 x) y := by
+      intro y _hy
+      exact ((hg.differentiable (by norm_num) y).hasDerivAt).hasDerivWithinAt
+    have hbound : forall y, y ∈ Set.Ico 0 x -> ‖deriv g y‖ <= L1 := by
+      intro y _hy
+      simpa [Real.norm_eq_abs] using hderiv_bound y
+    have h :=
+      norm_image_sub_le_of_norm_deriv_le_segment'
+        (f := g) (a := 0) (b := x) (C := L1) hhas hbound x
+        (Set.right_mem_Icc.mpr hx0)
+    simpa [g, Real.norm_eq_abs, sub_zero, abs_of_nonneg hx0] using h
+  · have hxle : x <= 0 := le_of_not_ge hx0
+    have hhas : forall y, y ∈ Set.Icc x 0 ->
+        HasDerivWithinAt g (deriv g y) (Set.Icc x 0) y := by
+      intro y _hy
+      exact ((hg.differentiable (by norm_num) y).hasDerivAt).hasDerivWithinAt
+    have hbound : forall y, y ∈ Set.Ico x 0 -> ‖deriv g y‖ <= L1 := by
+      intro y _hy
+      simpa [Real.norm_eq_abs] using hderiv_bound y
+    have h :=
+      norm_image_sub_le_of_norm_deriv_le_segment'
+        (f := g) (a := x) (b := 0) (C := L1) hhas hbound 0
+        (Set.right_mem_Icc.mpr hxle)
+    have hsymm : ‖g x - g 0‖ = ‖g 0 - g x‖ := by
+      rw [← norm_neg (g 0 - g x)]
+      simp
+    rw [← hsymm] at h
+    simpa [g, Real.norm_eq_abs, abs_of_nonpos hxle] using h
+
+theorem abs_apply_le_abs_zero_add_sum {n : Nat}
+    {f : (Fin n -> Real) -> Real} {L1 : Real}
+    (hf : ContDiff Real 1 f)
+    (hL1_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 1 f x i| <= L1)
+    (z : Fin n -> Real) :
+    |f z| <= |f (fun _ => 0)| + Finset.univ.sum (fun i : Fin n => L1 * |z i|) := by
+  classical
+  let p : Nat -> Fin n -> Real := fun k j => if (j : Nat) < k then z j else 0
+  let g : Nat -> Real := fun k => f (p k)
+  have hp_zero : p 0 = fun _ : Fin n => 0 := by
+    ext j
+    simp [p]
+  have hp_all : p n = z := by
+    ext j
+    simp [p, j.isLt]
+  have hp_succ : forall (k : Nat) (hk : k < n),
+      p (k + 1) = Function.update (p k) ⟨k, hk⟩ (z ⟨k, hk⟩) := by
+    intro k hk
+    ext j
+    let i : Fin n := ⟨k, hk⟩
+    by_cases hji : j = i
+    · subst j
+      simp [p, i]
+    · have hval_ne : (j : Nat) ≠ k := by
+        intro h
+        exact hji (Fin.ext h)
+      by_cases hjlt : (j : Nat) < k
+      · have hjlt_succ : (j : Nat) < k + 1 := Nat.lt_trans hjlt (Nat.lt_succ_self k)
+        simp [p, i, hji, hjlt, hjlt_succ]
+      · have hjnot_succ : ¬ (j : Nat) < k + 1 := by omega
+        simp [p, i, hji, hjlt, hjnot_succ]
+  have htel :
+      f z - f (fun _ : Fin n => 0) =
+        Finset.sum (Finset.range n) (fun k => g (k + 1) - g k) := by
+    have hsum := Finset.sum_range_sub (fun k => g k) n
+    calc
+      f z - f (fun _ : Fin n => 0) = g n - g 0 := by
+        simp [g, hp_all, hp_zero]
+      _ = Finset.sum (Finset.range n) (fun k => g (k + 1) - g k) := hsum.symm
+  have hstep : forall (k : Nat) (hk : k < n),
+      |g (k + 1) - g k| <= L1 * |z ⟨k, hk⟩| := by
+    intro k hk
+    let i : Fin n := ⟨k, hk⟩
+    have hpki : p k i = 0 := by
+      simp [p, i]
+    have hupdate0 : Function.update (p k) i 0 = p k := by
+      rw [Function.update_eq_self_iff]
+      exact hpki.symm
+    have hbound := coordinateSlice_abs_sub_zero_le
+      (f := f) (L1 := L1) hf hL1_bound (p k) i (z i)
+    have hsucc := hp_succ k hk
+    simpa [g, coordinateSlice, i, hsucc, hupdate0] using hbound
+  have hsum_abs :
+      |f z - f (fun _ : Fin n => 0)| <=
+        Finset.sum (Finset.range n) (fun k =>
+          if hk : k < n then L1 * |z ⟨k, hk⟩| else 0) := by
+    rw [htel]
+    calc
+      |Finset.sum (Finset.range n) (fun k => g (k + 1) - g k)|
+          <= Finset.sum (Finset.range n) (fun k => |g (k + 1) - g k|) := by
+            exact Finset.abs_sum_le_sum_abs _ _
+      _ <= Finset.sum (Finset.range n) (fun k =>
+            if hk : k < n then L1 * |z ⟨k, hk⟩| else 0) := by
+            refine Finset.sum_le_sum ?_
+            intro k hk
+            have hklt : k < n := Finset.mem_range.mp hk
+            simpa [hklt] using hstep k hklt
+  calc
+    |f z| = |f (fun _ : Fin n => 0) + (f z - f (fun _ : Fin n => 0))| := by
+      congr 1
+      ring
+    _ <= |f (fun _ : Fin n => 0)| + |f z - f (fun _ : Fin n => 0)| := abs_add_le _ _
+    _ <= |f (fun _ : Fin n => 0)| +
+        Finset.sum (Finset.range n) (fun k =>
+          if hk : k < n then L1 * |z ⟨k, hk⟩| else 0) := by
+      exact add_le_add (le_refl _) hsum_abs
+    _ = |f (fun _ : Fin n => 0)| + Finset.univ.sum (fun i : Fin n => L1 * |z i|) := by
+      rw [Finset.sum_fin_eq_sum_range]
+theorem integrable_f_apply_of_integrable_abs_coords {n : Nat}
+    {μ : Measure Ω} [IsFiniteMeasure μ]
+    {f : (Fin n -> Real) -> Real} {Z : Ω -> Fin n -> Real} {L1 : Real}
+    (hf : ContDiff Real 1 f)
+    (hL1_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 1 f x i| <= L1)
+    (hZ_meas : Measurable Z)
+    (hZ_abs : forall i : Fin n, Integrable (fun ω => |Z ω i|) μ) :
+    Integrable (fun ω => f (Z ω)) μ := by
+  have h_ae : AEStronglyMeasurable (fun ω => f (Z ω)) μ :=
+    (hf.continuous.measurable.comp hZ_meas).aestronglyMeasurable
+  have hsum_int :
+      Integrable (fun ω => Finset.univ.sum (fun i : Fin n => L1 * |Z ω i|)) μ := by
+    exact integrable_finset_sum Finset.univ (fun i _ => (hZ_abs i).const_mul L1)
+  have hdom :
+      Integrable
+        (fun ω => |f (fun _ : Fin n => 0)| +
+          Finset.univ.sum (fun i : Fin n => L1 * |Z ω i|)) μ :=
+    (integrable_const (|f (fun _ : Fin n => 0)|)).add hsum_int
+  have hbound : ∀ᵐ ω ∂μ,
+      ‖f (Z ω)‖ <= |f (fun _ : Fin n => 0)| +
+        Finset.univ.sum (fun i : Fin n => L1 * |Z ω i|) :=
+    Filter.Eventually.of_forall fun ω => by
+      simpa [Real.norm_eq_abs] using
+        abs_apply_le_abs_zero_add_sum
+          (f := f) (L1 := L1) hf hL1_bound (Z ω)
+  exact hdom.mono' h_ae hbound
+
+/-- The Taylor remainder contribution for one Lindeberg replacement step. -/
+theorem oneStep_taylor_remainder_bound
+    {μ : Measure Ω} {x y rx ry : Ω -> Real} {L3 : Real}
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ)
+    (hy3 : Integrable (fun ω => |y ω| ^ 3) μ)
+    (hrx : ∀ᵐ ω ∂μ, |rx ω| <= (1 / 6 : Real) * L3 * |x ω| ^ 3)
+    (hry : ∀ᵐ ω ∂μ, |ry ω| <= (1 / 6 : Real) * L3 * |y ω| ^ 3) :
+    |∫ ω, rx ω - ry ω ∂μ| <=
+      (1 / 6 : Real) * L3 *
+        ((∫ ω, |x ω| ^ 3 ∂μ) + ∫ ω, |y ω| ^ 3 ∂μ) := by
+  let c : Real := (1 / 6 : Real) * L3
+  have hg_int : Integrable (fun ω => c * (|x ω| ^ 3 + |y ω| ^ 3)) μ := by
+    exact (hx3.add hy3).const_mul c
+  have hbound :
+      ∀ᵐ ω ∂μ, ‖rx ω - ry ω‖ <= c * (|x ω| ^ 3 + |y ω| ^ 3) := by
+    filter_upwards [hrx, hry] with ω hxω hyω
+    have hx' : |rx ω| <= c * |x ω| ^ 3 := by simpa [c] using hxω
+    have hy' : |ry ω| <= c * |y ω| ^ 3 := by simpa [c] using hyω
+    calc
+      ‖rx ω - ry ω‖ = |rx ω - ry ω| := by simp [Real.norm_eq_abs]
+      _ <= |rx ω| + |ry ω| := by
+        simpa using abs_sub_le (rx ω) 0 (ry ω)
+      _ <= c * |x ω| ^ 3 + c * |y ω| ^ 3 := add_le_add hx' hy'
+      _ = c * (|x ω| ^ 3 + |y ω| ^ 3) := by ring
+  have hle := norm_integral_le_of_norm_le hg_int hbound
+  simpa [Real.norm_eq_abs, c, integral_const_mul, integral_add hx3 hy3] using hle
+
+/--
+The one-coordinate estimate used in the proof of Theorem 1.1.
+
+The assumptions `hlin` and `hquad` are exactly where the conditional expectation
+pull-out identity and the independence of `Y_i` from the frozen derivative enter.
+-/
+theorem oneStep_taylor_condExp_estimate
+    {μ : Measure Ω} {𝓕 : MeasurableSpace Ω}
+    (step : Real) (x y d1 d2 rx ry : Ω -> Real) (L3 : Real)
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ)
+    (hy3 : Integrable (fun ω => |y ω| ^ 3) μ)
+    (hrx : ∀ᵐ ω ∂μ, |rx ω| <= (1 / 6 : Real) * L3 * |x ω| ^ 3)
+    (hry : ∀ᵐ ω ∂μ, |ry ω| <= (1 / 6 : Real) * L3 * |y ω| ^ 3)
+    (h_step : step =
+      (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) +
+        (1 / 2 : Real) * (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) +
+          ∫ ω, rx ω - ry ω ∂μ)
+    (hlin :
+      (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) =
+        ∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ)
+    (hquad :
+      (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) =
+        ∫ ω,
+          ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+            ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ) :
+    |step| <=
+      |∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ| +
+        (1 / 2 : Real) *
+          |∫ ω,
+            ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+              ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ| +
+        (1 / 6 : Real) * L3 *
+          ((∫ ω, |x ω| ^ 3 ∂μ) + ∫ ω, |y ω| ^ 3 ∂μ) := by
+  let A : Real :=
+    ∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ
+  let B : Real :=
+    ∫ ω,
+      ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+        ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ
+  let R : Real := ∫ ω, rx ω - ry ω ∂μ
+  have hrem :
+      |R| <= (1 / 6 : Real) * L3 *
+        ((∫ ω, |x ω| ^ 3 ∂μ) + ∫ ω, |y ω| ^ 3 ∂μ) := by
+    simpa [R] using oneStep_taylor_remainder_bound
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (x := x) (y := y) (rx := rx) (ry := ry)
+      hx3 hy3 hrx hry
+  have hstep' : step = A + (1 / 2 : Real) * B + R := by
+    simpa [A, B, R, hlin, hquad] using h_step
+  rw [hstep']
+  have hhalf : 0 <= (1 / 2 : Real) := by norm_num
+  calc
+    |A + (1 / 2 : Real) * B + R|
+        <= |A + (1 / 2 : Real) * B| + |R| := abs_add_le _ _
+    _ <= |A| + |(1 / 2 : Real) * B| + |R| := by
+      nlinarith [abs_add_le A ((1 / 2 : Real) * B)]
+    _ = |A| + (1 / 2 : Real) * |B| + |R| := by
+      rw [abs_mul, abs_of_nonneg hhalf]
+    _ <= |A| + (1 / 2 : Real) * |B| +
+        (1 / 6 : Real) * L3 *
+          ((∫ ω, |x ω| ^ 3 ∂μ) + ∫ ω, |y ω| ^ 3 ∂μ) := by
+      nlinarith [hrem]
+theorem integral_taylor_step_expansion
+    {μ : Measure Ω} {fX fY x y d1 d2 rx ry : Ω -> Real}
+    (hlin_int : Integrable (fun ω => x ω * d1 ω - y ω * d1 ω) μ)
+    (hquad_int : Integrable (fun ω => (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω) μ)
+    (hrem_int : Integrable (fun ω => rx ω - ry ω) μ)
+    (h_taylor : (fun ω => fX ω - fY ω) =ᵐ[μ]
+      fun ω =>
+        (x ω * d1 ω - y ω * d1 ω) +
+          (1 / 2 : Real) * ((x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω) +
+            (rx ω - ry ω)) :
+    ∫ ω, fX ω - fY ω ∂μ =
+      (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) +
+        (1 / 2 : Real) * (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) +
+          ∫ ω, rx ω - ry ω ∂μ := by
+  let lin : Ω -> Real := fun ω => x ω * d1 ω - y ω * d1 ω
+  let quad : Ω -> Real := fun ω => (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω
+  let rem : Ω -> Real := fun ω => rx ω - ry ω
+  have h_taylor' : (fun ω => fX ω - fY ω) =ᵐ[μ]
+      fun ω => lin ω + ((1 / 2 : Real) * quad ω + rem ω) := by
+    simpa [lin, quad, rem, add_assoc] using h_taylor
+  calc
+    ∫ ω, fX ω - fY ω ∂μ =
+        ∫ ω, lin ω + ((1 / 2 : Real) * quad ω + rem ω) ∂μ := by
+          exact integral_congr_ae h_taylor'
+    _ = (∫ ω, lin ω ∂μ) + ∫ ω, (1 / 2 : Real) * quad ω + rem ω ∂μ := by
+          simpa [lin, quad, rem] using
+            integral_add hlin_int ((hquad_int.const_mul (1 / 2 : Real)).add hrem_int)
+    _ = (∫ ω, lin ω ∂μ) +
+        ((∫ ω, (1 / 2 : Real) * quad ω ∂μ) + ∫ ω, rem ω ∂μ) := by
+          simpa [quad, rem] using
+            integral_add (hquad_int.const_mul (1 / 2 : Real)) hrem_int
+    _ = (∫ ω, lin ω ∂μ) +
+        (1 / 2 : Real) * (∫ ω, quad ω ∂μ) + ∫ ω, rem ω ∂μ := by
+          rw [integral_const_mul]
+          ring
+    _ = (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) +
+        (1 / 2 : Real) * (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) +
+          ∫ ω, rx ω - ry ω ∂μ := by
+          rfl
+
+/--
+The one-coordinate estimate with the conditional-expectation identities proved
+from measurability and independence.
+
+The remaining analytic input is `h_step`, the Taylor expansion of the coordinate
+replacement step into linear, quadratic, and remainder terms, together with the
+remainder bounds `hrx` and `hry`.
+-/
+theorem oneStep_taylor_condExp_estimate_of_independence
+    {μ : Measure Ω} {𝓕 : MeasurableSpace Ω} (h𝓕 : 𝓕 <= mΩ)
+    [SigmaFinite (μ.trim h𝓕)]
+    (step : Real) (x y d1 d2 rx ry : Ω -> Real) (L3 : Real)
+    (hd1𝓕 : StronglyMeasurable[𝓕] d1)
+    (hd2𝓕 : StronglyMeasurable[𝓕] d2)
+    (hx : Integrable x μ)
+    (hx2 : Integrable (fun ω => (x ω) ^ 2) μ)
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ)
+    (hy3 : Integrable (fun ω => |y ω| ^ 3) μ)
+    (hxd1 : Integrable (fun ω => x ω * d1 ω) μ)
+    (hyd1 : Integrable (fun ω => y ω * d1 ω) μ)
+    (hx2d2 : Integrable (fun ω => (x ω) ^ 2 * d2 ω) μ)
+    (hy2d2 : Integrable (fun ω => (y ω) ^ 2 * d2 ω) μ)
+    (hcxd1 : Integrable (fun ω => (condExp 𝓕 μ x) ω * d1 ω) μ)
+    (hcx2d2 : Integrable
+      (fun ω => (condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω * d2 ω) μ)
+    (hconst1 : Integrable (fun ω => (∫ ν, y ν ∂μ) * d1 ω) μ)
+    (hconst2 : Integrable (fun ω => (∫ ν, (y ν) ^ 2 ∂μ) * d2 ω) μ)
+    (hy_ae : AEStronglyMeasurable[mΩ] y μ)
+    (hy2_ae : AEStronglyMeasurable[mΩ] (fun ω => (y ω) ^ 2) μ)
+    (hd1_ae : AEStronglyMeasurable[mΩ] d1 μ)
+    (hd2_ae : AEStronglyMeasurable[mΩ] d2 μ)
+    (hind1 : IndepFun y d1 μ)
+    (hind2 : IndepFun (fun ω => (y ω) ^ 2) d2 μ)
+    (hrx : ∀ᵐ ω ∂μ, |rx ω| <= (1 / 6 : Real) * L3 * |x ω| ^ 3)
+    (hry : ∀ᵐ ω ∂μ, |ry ω| <= (1 / 6 : Real) * L3 * |y ω| ^ 3)
+    (h_step : step =
+      (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) +
+        (1 / 2 : Real) * (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) +
+          ∫ ω, rx ω - ry ω ∂μ) :
+    |step| <=
+      |∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ| +
+        (1 / 2 : Real) *
+          |∫ ω,
+            ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+              ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ| +
+        (1 / 6 : Real) * L3 *
+          ((∫ ω, |x ω| ^ 3 ∂μ) + ∫ ω, |y ω| ^ 3 ∂μ) := by
+  have hlin :
+      (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) =
+        ∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ :=
+    integral_sub_mul_eq_condExp_sub_integral_mul
+      (Ω := Ω) (mΩ := mΩ) h𝓕 hd1𝓕 hx hxd1 hyd1
+      hcxd1 hconst1 hy_ae hd1_ae hind1
+  have hquad :
+      (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) =
+        ∫ ω,
+          ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+            ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ :=
+    integral_sub_mul_eq_condExp_sub_integral_mul
+      (Ω := Ω) (mΩ := mΩ) h𝓕 hd2𝓕 hx2 hx2d2 hy2d2
+      hcx2d2 hconst2 hy2_ae hd2_ae hind2
+  exact oneStep_taylor_condExp_estimate
+    (Ω := Ω) (mΩ := mΩ) (μ := μ) (𝓕 := 𝓕)
+    step x y d1 d2 rx ry L3 hx3 hy3 hrx hry h_step hlin hquad
+
+/--
+One-step estimate where the frozen derivative is measurable with respect to a
+larger sigma-algebra `𝓖`.
+
+The final error terms are still expressed with the paper's sigma-algebra `𝓕`.
+The bridge is supplied by `hcond1` and `hcond2`, which state that conditioning
+`x` and `x^2` on the larger frozen sigma-algebra gives the same a.e. functions
+as conditioning on `𝓕`.
+-/
+theorem oneStep_taylor_condExp_estimate_of_enlarged_conditioning
+    {μ : Measure Ω} {𝓕 𝓖 : MeasurableSpace Ω} (h𝓖 : 𝓖 <= mΩ)
+    [SigmaFinite (μ.trim h𝓖)]
+    (step : Real) (x y d1 d2 rx ry : Ω -> Real) (L3 : Real)
+    (hd1𝓖 : StronglyMeasurable[𝓖] d1)
+    (hd2𝓖 : StronglyMeasurable[𝓖] d2)
+    (hx : Integrable x μ)
+    (hx2 : Integrable (fun ω => (x ω) ^ 2) μ)
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ)
+    (hy3 : Integrable (fun ω => |y ω| ^ 3) μ)
+    (hxd1 : Integrable (fun ω => x ω * d1 ω) μ)
+    (hyd1 : Integrable (fun ω => y ω * d1 ω) μ)
+    (hx2d2 : Integrable (fun ω => (x ω) ^ 2 * d2 ω) μ)
+    (hy2d2 : Integrable (fun ω => (y ω) ^ 2 * d2 ω) μ)
+    (hcxd1 : Integrable (fun ω => (condExp 𝓕 μ x) ω * d1 ω) μ)
+    (hcx2d2 : Integrable
+      (fun ω => (condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω * d2 ω) μ)
+    (hconst1 : Integrable (fun ω => (∫ ν, y ν ∂μ) * d1 ω) μ)
+    (hconst2 : Integrable (fun ω => (∫ ν, (y ν) ^ 2 ∂μ) * d2 ω) μ)
+    (hy_ae : AEStronglyMeasurable[mΩ] y μ)
+    (hy2_ae : AEStronglyMeasurable[mΩ] (fun ω => (y ω) ^ 2) μ)
+    (hd1_ae : AEStronglyMeasurable[mΩ] d1 μ)
+    (hd2_ae : AEStronglyMeasurable[mΩ] d2 μ)
+    (hind1 : IndepFun y d1 μ)
+    (hind2 : IndepFun (fun ω => (y ω) ^ 2) d2 μ)
+    (hcond1 :
+      (condExp 𝓖 μ x) =ᵐ[μ]
+        condExp 𝓕 μ x)
+    (hcond2 :
+      (condExp 𝓖 μ (fun ω => (x ω) ^ 2)) =ᵐ[μ]
+        condExp 𝓕 μ (fun ω => (x ω) ^ 2))
+    (hrx : ∀ᵐ ω ∂μ, |rx ω| <= (1 / 6 : Real) * L3 * |x ω| ^ 3)
+    (hry : ∀ᵐ ω ∂μ, |ry ω| <= (1 / 6 : Real) * L3 * |y ω| ^ 3)
+    (h_step : step =
+      (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) +
+        (1 / 2 : Real) * (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) +
+          ∫ ω, rx ω - ry ω ∂μ) :
+    |step| <=
+      |∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ| +
+        (1 / 2 : Real) *
+          |∫ ω,
+            ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+              ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ| +
+        (1 / 6 : Real) * L3 *
+          ((∫ ω, |x ω| ^ 3 ∂μ) + ∫ ω, |y ω| ^ 3 ∂μ) := by
+  have hlin :
+      (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) =
+        ∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ :=
+    integral_sub_mul_eq_ae_condExp_sub_integral_mul
+      (Ω := Ω) (mΩ := mΩ) h𝓖 hd1𝓖 hx hxd1 hyd1
+      hcxd1 hconst1 hy_ae hd1_ae hind1 hcond1
+  have hquad :
+      (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) =
+        ∫ ω,
+          ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+            ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ :=
+    integral_sub_mul_eq_ae_condExp_sub_integral_mul
+      (Ω := Ω) (mΩ := mΩ) h𝓖 hd2𝓖 hx2 hx2d2 hy2d2
+      hcx2d2 hconst2 hy2_ae hd2_ae hind2 hcond2
+  exact oneStep_taylor_condExp_estimate
+    (Ω := Ω) (mΩ := mΩ) (μ := μ) (𝓕 := 𝓕)
+    step x y d1 d2 rx ry L3 hx3 hy3 hrx hry h_step hlin hquad
+
+/--
+Complete one-step estimate from Taylor expansion data, conditional expectation,
+and independence.
+
+Unlike `oneStep_taylor_condExp_estimate`, this theorem does not assume the
+linear/quadratic conditional-expectation identities or the integrated Taylor
+step: it derives them.
+-/
+theorem oneStep_taylor_condExp_estimate_complete
+    {μ : Measure Ω} {𝓕 : MeasurableSpace Ω} (h𝓕 : 𝓕 <= mΩ)
+    [SigmaFinite (μ.trim h𝓕)]
+    (fX fY x y d1 d2 rx ry : Ω -> Real) (L3 : Real)
+    (hd1𝓕 : StronglyMeasurable[𝓕] d1)
+    (hd2𝓕 : StronglyMeasurable[𝓕] d2)
+    (hx : Integrable x μ)
+    (hx2 : Integrable (fun ω => (x ω) ^ 2) μ)
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ)
+    (hy3 : Integrable (fun ω => |y ω| ^ 3) μ)
+    (hxd1 : Integrable (fun ω => x ω * d1 ω) μ)
+    (hyd1 : Integrable (fun ω => y ω * d1 ω) μ)
+    (hx2d2 : Integrable (fun ω => (x ω) ^ 2 * d2 ω) μ)
+    (hy2d2 : Integrable (fun ω => (y ω) ^ 2 * d2 ω) μ)
+    (hrx_int : Integrable rx μ)
+    (hry_int : Integrable ry μ)
+    (hcxd1 : Integrable (fun ω => (condExp 𝓕 μ x) ω * d1 ω) μ)
+    (hcx2d2 : Integrable
+      (fun ω => (condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω * d2 ω) μ)
+    (hconst1 : Integrable (fun ω => (∫ ν, y ν ∂μ) * d1 ω) μ)
+    (hconst2 : Integrable (fun ω => (∫ ν, (y ν) ^ 2 ∂μ) * d2 ω) μ)
+    (hy_ae : AEStronglyMeasurable[mΩ] y μ)
+    (hy2_ae : AEStronglyMeasurable[mΩ] (fun ω => (y ω) ^ 2) μ)
+    (hd1_ae : AEStronglyMeasurable[mΩ] d1 μ)
+    (hd2_ae : AEStronglyMeasurable[mΩ] d2 μ)
+    (hind1 : IndepFun y d1 μ)
+    (hind2 : IndepFun (fun ω => (y ω) ^ 2) d2 μ)
+    (hrx : ∀ᵐ ω ∂μ, |rx ω| <= (1 / 6 : Real) * L3 * |x ω| ^ 3)
+    (hry : ∀ᵐ ω ∂μ, |ry ω| <= (1 / 6 : Real) * L3 * |y ω| ^ 3)
+    (h_taylor : (fun ω => fX ω - fY ω) =ᵐ[μ]
+      fun ω =>
+        (x ω * d1 ω - y ω * d1 ω) +
+          (1 / 2 : Real) * ((x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω) +
+            (rx ω - ry ω)) :
+    |∫ ω, fX ω - fY ω ∂μ| <=
+      |∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ| +
+        (1 / 2 : Real) *
+          |∫ ω,
+            ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+              ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ| +
+        (1 / 6 : Real) * L3 *
+          ((∫ ω, |x ω| ^ 3 ∂μ) + ∫ ω, |y ω| ^ 3 ∂μ) := by
+  have hlin_int : Integrable (fun ω => x ω * d1 ω - y ω * d1 ω) μ := hxd1.sub hyd1
+  have hquad_int :
+      Integrable (fun ω => (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω) μ :=
+    hx2d2.sub hy2d2
+  have hrem_int : Integrable (fun ω => rx ω - ry ω) μ := hrx_int.sub hry_int
+  have h_step :
+      (∫ ω, fX ω - fY ω ∂μ) =
+        (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) +
+          (1 / 2 : Real) * (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) +
+            ∫ ω, rx ω - ry ω ∂μ :=
+    integral_taylor_step_expansion
+      (Ω := Ω) (mΩ := mΩ) hlin_int hquad_int hrem_int h_taylor
+  exact oneStep_taylor_condExp_estimate_of_independence
+    (Ω := Ω) (mΩ := mΩ) h𝓕 (∫ ω, fX ω - fY ω ∂μ)
+    x y d1 d2 rx ry L3 hd1𝓕 hd2𝓕 hx hx2 hx3 hy3 hxd1 hyd1 hx2d2 hy2d2
+    hcxd1 hcx2d2 hconst1 hconst2 hy_ae hy2_ae hd1_ae hd2_ae hind1 hind2
+    hrx hry h_step
+
+/--
+Complete one-step estimate when the frozen derivatives are measurable with
+respect to a larger sigma-algebra `𝓖`, while the final error terms are written
+using the paper's sigma-algebra `𝓕`.
+
+The only extra inputs beyond
+`oneStep_taylor_condExp_estimate_complete` are `hcond1` and `hcond2`: they are
+the probabilistic facts, usually proved from independence, identifying the
+larger conditional expectations with the desired `𝓕`-conditional expectations.
+-/
+theorem oneStep_taylor_condExp_estimate_complete_enlarged
+    {μ : Measure Ω} {𝓕 𝓖 : MeasurableSpace Ω} (h𝓖 : 𝓖 <= mΩ)
+    [SigmaFinite (μ.trim h𝓖)]
+    (fX fY x y d1 d2 rx ry : Ω -> Real) (L3 : Real)
+    (hd1𝓖 : StronglyMeasurable[𝓖] d1)
+    (hd2𝓖 : StronglyMeasurable[𝓖] d2)
+    (hx : Integrable x μ)
+    (hx2 : Integrable (fun ω => (x ω) ^ 2) μ)
+    (hx3 : Integrable (fun ω => |x ω| ^ 3) μ)
+    (hy3 : Integrable (fun ω => |y ω| ^ 3) μ)
+    (hxd1 : Integrable (fun ω => x ω * d1 ω) μ)
+    (hyd1 : Integrable (fun ω => y ω * d1 ω) μ)
+    (hx2d2 : Integrable (fun ω => (x ω) ^ 2 * d2 ω) μ)
+    (hy2d2 : Integrable (fun ω => (y ω) ^ 2 * d2 ω) μ)
+    (hrx_int : Integrable rx μ)
+    (hry_int : Integrable ry μ)
+    (hcxd1 : Integrable (fun ω => (condExp 𝓕 μ x) ω * d1 ω) μ)
+    (hcx2d2 : Integrable
+      (fun ω => (condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω * d2 ω) μ)
+    (hconst1 : Integrable (fun ω => (∫ ν, y ν ∂μ) * d1 ω) μ)
+    (hconst2 : Integrable (fun ω => (∫ ν, (y ν) ^ 2 ∂μ) * d2 ω) μ)
+    (hy_ae : AEStronglyMeasurable[mΩ] y μ)
+    (hy2_ae : AEStronglyMeasurable[mΩ] (fun ω => (y ω) ^ 2) μ)
+    (hd1_ae : AEStronglyMeasurable[mΩ] d1 μ)
+    (hd2_ae : AEStronglyMeasurable[mΩ] d2 μ)
+    (hind1 : IndepFun y d1 μ)
+    (hind2 : IndepFun (fun ω => (y ω) ^ 2) d2 μ)
+    (hcond1 :
+      (condExp 𝓖 μ x) =ᵐ[μ]
+        condExp 𝓕 μ x)
+    (hcond2 :
+      (condExp 𝓖 μ (fun ω => (x ω) ^ 2)) =ᵐ[μ]
+        condExp 𝓕 μ (fun ω => (x ω) ^ 2))
+    (hrx : ∀ᵐ ω ∂μ, |rx ω| <= (1 / 6 : Real) * L3 * |x ω| ^ 3)
+    (hry : ∀ᵐ ω ∂μ, |ry ω| <= (1 / 6 : Real) * L3 * |y ω| ^ 3)
+    (h_taylor : (fun ω => fX ω - fY ω) =ᵐ[μ]
+      fun ω =>
+        (x ω * d1 ω - y ω * d1 ω) +
+          (1 / 2 : Real) * ((x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω) +
+            (rx ω - ry ω)) :
+    |∫ ω, fX ω - fY ω ∂μ| <=
+      |∫ ω, ((condExp 𝓕 μ x) ω - ∫ ν, y ν ∂μ) * d1 ω ∂μ| +
+        (1 / 2 : Real) *
+          |∫ ω,
+            ((condExp 𝓕 μ (fun ω => (x ω) ^ 2)) ω -
+              ∫ ν, (y ν) ^ 2 ∂μ) * d2 ω ∂μ| +
+        (1 / 6 : Real) * L3 *
+          ((∫ ω, |x ω| ^ 3 ∂μ) + ∫ ω, |y ω| ^ 3 ∂μ) := by
+  have hlin_int : Integrable (fun ω => x ω * d1 ω - y ω * d1 ω) μ := hxd1.sub hyd1
+  have hquad_int :
+      Integrable (fun ω => (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω) μ :=
+    hx2d2.sub hy2d2
+  have hrem_int : Integrable (fun ω => rx ω - ry ω) μ := hrx_int.sub hry_int
+  have h_step :
+      (∫ ω, fX ω - fY ω ∂μ) =
+        (∫ ω, x ω * d1 ω - y ω * d1 ω ∂μ) +
+          (1 / 2 : Real) * (∫ ω, (x ω) ^ 2 * d2 ω - (y ω) ^ 2 * d2 ω ∂μ) +
+            ∫ ω, rx ω - ry ω ∂μ :=
+    integral_taylor_step_expansion
+      (Ω := Ω) (mΩ := mΩ) hlin_int hquad_int hrem_int h_taylor
+  exact oneStep_taylor_condExp_estimate_of_enlarged_conditioning
+    (Ω := Ω) (mΩ := mΩ) (𝓕 := 𝓕) (𝓖 := 𝓖) h𝓖
+    (∫ ω, fX ω - fY ω ∂μ) x y d1 d2 rx ry L3
+    hd1𝓖 hd2𝓖 hx hx2 hx3 hy3 hxd1 hyd1 hx2d2 hy2d2
+    hcxd1 hcx2d2 hconst1 hconst2 hy_ae hy2_ae hd1_ae hd2_ae
+    hind1 hind2 hcond1 hcond2 hrx hry h_step
+
+/-! ## Main Proof Ladder -/
+
+/--
+A probabilistic formalization of the final Lindeberg estimate in Theorem 1.1.
+
+The hypotheses `h_step` are the one-coordinate estimates obtained from Taylor's
+theorem and the conditional-expectation/independence identities in the paper.
+The theorem then performs the measure-theoretic bounding step with mathlib's
+conditional expectation and sums the coordinate estimates.
+-/
+theorem theoremOneOne_probability
+    {n : Nat}
+    (μ : Measure Ω) (𝓕 : Fin n -> MeasurableSpace Ω)
+    (efX efY : Real) (increments : Fin n -> Real)
+    (X Y : Fin n -> Ω -> Real) (D1 D2 : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (h_telescopes : efX - efY = Finset.univ.sum increments)
+    (h_step : forall i : Fin n,
+      abs (increments i) <=
+        abs (∫ ω,
+          ((condExp (𝓕 i) μ (X i)) ω -
+            ∫ ω, Y i ω ∂μ) * D1 i ω ∂μ) +
+        (1 / 2 : Real) *
+          abs (∫ ω,
+            ((condExp (𝓕 i) μ (fun ω => (X i ω) ^ 2)) ω -
+              ∫ ω, (Y i ω) ^ 2 ∂μ) * D2 i ω ∂μ) +
+        (1 / 6 : Real) * L3 * @thirdMomentContribution Ω mΩ n μ X Y i)
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (X i)) ω - ∫ ω, Y i ω ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => (X i ω) ^ 2)) ω -
+          ∫ ω, (Y i ω) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n, @thirdMomentContribution Ω mΩ n μ X Y i <= M3) :
+    abs (efX - efY) <=
+      theoremOneOneBound (@firstMomentError Ω mΩ n μ 𝓕 X Y)
+        (@secondMomentError Ω mΩ n μ 𝓕 X Y)
+        L1 L2 L3 M3 := by
+  apply theoremOneOne_deterministic_of_thirdMomentBound
+    efX efY increments (@firstMomentError Ω mΩ n μ 𝓕 X Y)
+    (@secondMomentError Ω mΩ n μ 𝓕 X Y)
+    (@thirdMomentContribution Ω mΩ n μ X Y) L1 L2 L3 M3 hL3 hthird h_telescopes
+  intro i
+  refine le_trans (h_step i) ?_
+  have hfirst :
+      abs (∫ ω,
+        ((condExp (𝓕 i) μ (X i)) ω -
+          ∫ ω, Y i ω ∂μ) * D1 i ω ∂μ) <=
+        @firstMomentError Ω mΩ n μ 𝓕 X Y i * L1 := by
+    simpa [firstMomentError] using
+      abs_integral_mul_le_integral_abs_mul_bound
+        (Ω := Ω) (mΩ := mΩ) (μ := μ)
+        (a := fun ω =>
+          (condExp (𝓕 i) μ (X i)) ω - ∫ ω, Y i ω ∂μ)
+        (d := D1 i) (L := L1) (hInt1 i) (hD1 i)
+  have hsecond :
+      abs (∫ ω,
+        ((condExp (𝓕 i) μ (fun ω => (X i ω) ^ 2)) ω -
+          ∫ ω, (Y i ω) ^ 2 ∂μ) * D2 i ω ∂μ) <=
+        @secondMomentError Ω mΩ n μ 𝓕 X Y i * L2 := by
+    simpa [secondMomentError] using
+      abs_integral_mul_le_integral_abs_mul_bound
+        (Ω := Ω) (mΩ := mΩ) (μ := μ)
+        (a := fun ω =>
+          (condExp (𝓕 i) μ (fun ω => (X i ω) ^ 2)) ω -
+            ∫ ω, (Y i ω) ^ 2 ∂μ)
+        (d := D2 i) (L := L2) (hInt2 i) (hD2 i)
+  have hhalf : 0 <= (1 / 2 : Real) := by norm_num
+  nlinarith [hfirst, hsecond, mul_le_mul_of_nonneg_left hsecond hhalf]
+
+/--
+The probabilistic Lindeberg bound assembled from complete one-step replacement
+estimates.
+
+For each coordinate, the hypotheses provide:
+* the frozen derivative functions `D1 i`, `D2 i`,
+* Taylor remainders `RX i`, `RY i`,
+* the a.e. Taylor expansion of the replacement integrand,
+* measurability, integrability, and independence facts needed to prove the
+  conditional-expectation identities.
+
+The only global structural hypothesis is `h_telescopes`, the usual Lindeberg
+telescoping identity for the interpolation sequence.
+-/
+theorem theoremOneOne_probability_complete
+    {n : Nat}
+    (μ : Measure Ω) (𝓕 : Fin n -> MeasurableSpace Ω)
+    (efX efY : Real)
+    (FX FY X Y D1 D2 RX RY : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (h𝓕 : forall i : Fin n, 𝓕 i <= mΩ)
+    (hSigma : forall i : Fin n, SigmaFinite (μ.trim (h𝓕 i)))
+    (h_telescopes :
+      efX - efY = Finset.univ.sum (fun i : Fin n => ∫ ω, FX i ω - FY i ω ∂μ))
+    (hd1𝓕 : forall i : Fin n, StronglyMeasurable[𝓕 i] (D1 i))
+    (hd2𝓕 : forall i : Fin n, StronglyMeasurable[𝓕 i] (D2 i))
+    (hx : forall i : Fin n, Integrable (X i) μ)
+    (hx2 : forall i : Fin n, Integrable (fun ω => (X i ω) ^ 2) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X i ω| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y i ω| ^ 3) μ)
+    (hxd1 : forall i : Fin n, Integrable (fun ω => X i ω * D1 i ω) μ)
+    (hyd1 : forall i : Fin n, Integrable (fun ω => Y i ω * D1 i ω) μ)
+    (hx2d2 : forall i : Fin n, Integrable (fun ω => (X i ω) ^ 2 * D2 i ω) μ)
+    (hy2d2 : forall i : Fin n, Integrable (fun ω => (Y i ω) ^ 2 * D2 i ω) μ)
+    (hrx_int : forall i : Fin n, Integrable (RX i) μ)
+    (hry_int : forall i : Fin n, Integrable (RY i) μ)
+    (hcxd1 : forall i : Fin n,
+      Integrable (fun ω => (condExp (𝓕 i) μ (X i)) ω * D1 i ω) μ)
+    (hcx2d2 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => (X i ω) ^ 2)) ω * D2 i ω) μ)
+    (hconst1 : forall i : Fin n, Integrable (fun ω => (∫ ν, Y i ν ∂μ) * D1 i ω) μ)
+    (hconst2 : forall i : Fin n,
+      Integrable (fun ω => (∫ ν, (Y i ν) ^ 2 ∂μ) * D2 i ω) μ)
+    (hy_ae : forall i : Fin n, AEStronglyMeasurable (Y i) μ)
+    (hy2_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => (Y i ω) ^ 2) μ)
+    (hd1_ae : forall i : Fin n, AEStronglyMeasurable (D1 i) μ)
+    (hd2_ae : forall i : Fin n, AEStronglyMeasurable (D2 i) μ)
+    (hind1 : forall i : Fin n, IndepFun (Y i) (D1 i) μ)
+    (hind2 : forall i : Fin n, IndepFun (fun ω => (Y i ω) ^ 2) (D2 i) μ)
+    (hrx : forall i : Fin n,
+      ∀ᵐ ω ∂μ, |RX i ω| <= (1 / 6 : Real) * L3 * |X i ω| ^ 3)
+    (hry : forall i : Fin n,
+      ∀ᵐ ω ∂μ, |RY i ω| <= (1 / 6 : Real) * L3 * |Y i ω| ^ 3)
+    (h_taylor : forall i : Fin n,
+      (fun ω => FX i ω - FY i ω) =ᵐ[μ]
+        fun ω =>
+          (X i ω * D1 i ω - Y i ω * D1 i ω) +
+            (1 / 2 : Real) * ((X i ω) ^ 2 * D2 i ω - (Y i ω) ^ 2 * D2 i ω) +
+              (RX i ω - RY i ω))
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (X i)) ω - ∫ ω, Y i ω ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => (X i ω) ^ 2)) ω -
+          ∫ ω, (Y i ω) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n, @thirdMomentContribution Ω mΩ n μ X Y i <= M3) :
+    abs (efX - efY) <=
+      theoremOneOneBound (@firstMomentError Ω mΩ n μ 𝓕 X Y)
+        (@secondMomentError Ω mΩ n μ 𝓕 X Y)
+        L1 L2 L3 M3 := by
+  apply theoremOneOne_probability
+    (Ω := Ω) (mΩ := mΩ) μ 𝓕 efX efY
+    (fun i : Fin n => ∫ ω, FX i ω - FY i ω ∂μ)
+    X Y D1 D2 L1 L2 L3 M3 hL3 h_telescopes
+  · intro i
+    letI : SigmaFinite (μ.trim (h𝓕 i)) := hSigma i
+    simpa [thirdMomentContribution] using
+      oneStep_taylor_condExp_estimate_complete
+        (Ω := Ω) (mΩ := mΩ) (μ := μ) (𝓕 := 𝓕 i)
+        (h𝓕 i) (FX i) (FY i) (X i) (Y i) (D1 i) (D2 i) (RX i) (RY i) L3
+        (hd1𝓕 i) (hd2𝓕 i) (hx i) (hx2 i) (hx3 i) (hy3 i)
+        (hxd1 i) (hyd1 i) (hx2d2 i) (hy2d2 i) (hrx_int i) (hry_int i)
+        (hcxd1 i) (hcx2d2 i) (hconst1 i) (hconst2 i)
+        (hy_ae i) (hy2_ae i) (hd1_ae i) (hd2_ae i)
+        (hind1 i) (hind2 i) (hrx i) (hry i) (h_taylor i)
+  · exact hD1
+  · exact hD2
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+theorem theoremOneOne_probability_complete_interpolation
+    {n : Nat}
+    (μ : Measure Ω) (𝓕 : Fin n -> MeasurableSpace Ω)
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 RX RY : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (h𝓕 : forall i : Fin n, 𝓕 i <= mΩ)
+    (hSigma : forall i : Fin n, SigmaFinite (μ.trim (h𝓕 i)))
+    (hIntInterp : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ)
+    (hd1𝓕 : forall i : Fin n, StronglyMeasurable[𝓕 i] (D1 i))
+    (hd2𝓕 : forall i : Fin n, StronglyMeasurable[𝓕 i] (D2 i))
+    (hx : forall i : Fin n, Integrable (fun ω => X ω i) μ)
+    (hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hxd1 : forall i : Fin n, Integrable (fun ω => X ω i * D1 i ω) μ)
+    (hyd1 : forall i : Fin n, Integrable (fun ω => Y ω i * D1 i ω) μ)
+    (hx2d2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2 * D2 i ω) μ)
+    (hy2d2 : forall i : Fin n, Integrable (fun ω => (Y ω i) ^ 2 * D2 i ω) μ)
+    (hrx_int : forall i : Fin n, Integrable (RX i) μ)
+    (hry_int : forall i : Fin n, Integrable (RY i) μ)
+    (hcxd1 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => X ω i)) ω * D1 i ω) μ)
+    (hcx2d2 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω * D2 i ω) μ)
+    (hconst1 : forall i : Fin n, Integrable (fun ω => (∫ ν, Y ν i ∂μ) * D1 i ω) μ)
+    (hconst2 : forall i : Fin n,
+      Integrable (fun ω => (∫ ν, (Y ν i) ^ 2 ∂μ) * D2 i ω) μ)
+    (hy_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => Y ω i) μ)
+    (hy2_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => (Y ω i) ^ 2) μ)
+    (hd1_ae : forall i : Fin n, AEStronglyMeasurable (D1 i) μ)
+    (hd2_ae : forall i : Fin n, AEStronglyMeasurable (D2 i) μ)
+    (hind1 : forall i : Fin n, IndepFun (fun ω => Y ω i) (D1 i) μ)
+    (hind2 : forall i : Fin n, IndepFun (fun ω => (Y ω i) ^ 2) (D2 i) μ)
+    (hrx : forall i : Fin n,
+      ∀ᵐ ω ∂μ, |RX i ω| <= (1 / 6 : Real) * L3 * |X ω i| ^ 3)
+    (hry : forall i : Fin n,
+      ∀ᵐ ω ∂μ, |RY i ω| <= (1 / 6 : Real) * L3 * |Y ω i| ^ 3)
+    (h_taylor : forall i : Fin n,
+      (fun ω =>
+        f (lindebergInterpolate X Y (i + 1) ω) -
+          f (lindebergInterpolate X Y i ω)) =ᵐ[μ]
+        fun ω =>
+          (X ω i * D1 i ω - Y ω i * D1 i ω) +
+            (1 / 2 : Real) * ((X ω i) ^ 2 * D2 i ω - (Y ω i) ^ 2 * D2 i ω) +
+              (RX i ω - RY i ω))
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => X ω i)) ω - ∫ ν, Y ν i ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω -
+          ∫ ν, (Y ν i) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n,
+      @thirdMomentContribution Ω mΩ n μ (coordinateProcess X) (coordinateProcess Y) i <= M3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      theoremOneOneBound
+        (@firstMomentError Ω mΩ n μ 𝓕 (coordinateProcess X) (coordinateProcess Y))
+        (@secondMomentError Ω mΩ n μ 𝓕 (coordinateProcess X) (coordinateProcess Y))
+        L1 L2 L3 M3 := by
+  apply theoremOneOne_probability_complete
+    (Ω := Ω) (mΩ := mΩ) μ 𝓕
+    (∫ ω, f (X ω) ∂μ) (∫ ω, f (Y ω) ∂μ)
+    (fun i ω => f (lindebergInterpolate X Y (i + 1) ω))
+    (fun i ω => f (lindebergInterpolate X Y i ω))
+    (coordinateProcess X) (coordinateProcess Y) D1 D2 RX RY L1 L2 L3 M3 hL3 h𝓕 hSigma
+  · exact lindeberg_integral_telescope (Ω := Ω) (mΩ := mΩ) μ f X Y hIntInterp
+  · exact hd1𝓕
+  · exact hd2𝓕
+  · exact hx
+  · exact hx2
+  · exact hx3
+  · exact hy3
+  · exact hxd1
+  · exact hyd1
+  · exact hx2d2
+  · exact hy2d2
+  · exact hrx_int
+  · exact hry_int
+  · exact hcxd1
+  · exact hcx2d2
+  · exact hconst1
+  · exact hconst2
+  · exact hy_ae
+  · exact hy2_ae
+  · exact hd1_ae
+  · exact hd2_ae
+  · exact hind1
+  · exact hind2
+  · exact hrx
+  · exact hry
+  · exact h_taylor
+  · exact hD1
+  · exact hD2
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+theorem theoremOneOne_probability_complete_interpolation_residual
+    {n : Nat}
+    (μ : Measure Ω) (𝓕 : Fin n -> MeasurableSpace Ω)
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (h𝓕 : forall i : Fin n, 𝓕 i <= mΩ)
+    (hSigma : forall i : Fin n, SigmaFinite (μ.trim (h𝓕 i)))
+    (hIntInterp : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ)
+    (hd1𝓕 : forall i : Fin n, StronglyMeasurable[𝓕 i] (D1 i))
+    (hd2𝓕 : forall i : Fin n, StronglyMeasurable[𝓕 i] (D2 i))
+    (hx : forall i : Fin n, Integrable (fun ω => X ω i) μ)
+    (hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hxd1 : forall i : Fin n, Integrable (fun ω => X ω i * D1 i ω) μ)
+    (hyd1 : forall i : Fin n, Integrable (fun ω => Y ω i * D1 i ω) μ)
+    (hx2d2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2 * D2 i ω) μ)
+    (hy2d2 : forall i : Fin n, Integrable (fun ω => (Y ω i) ^ 2 * D2 i ω) μ)
+    (hrx_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (X ω i)) μ)
+    (hry_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (Y ω i)) μ)
+    (hcxd1 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => X ω i)) ω * D1 i ω) μ)
+    (hcx2d2 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω * D2 i ω) μ)
+    (hconst1 : forall i : Fin n, Integrable (fun ω => (∫ ν, Y ν i ∂μ) * D1 i ω) μ)
+    (hconst2 : forall i : Fin n,
+      Integrable (fun ω => (∫ ν, (Y ν i) ^ 2 ∂μ) * D2 i ω) μ)
+    (hy_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => Y ω i) μ)
+    (hy2_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => (Y ω i) ^ 2) μ)
+    (hd1_ae : forall i : Fin n, AEStronglyMeasurable (D1 i) μ)
+    (hd2_ae : forall i : Fin n, AEStronglyMeasurable (D2 i) μ)
+    (hind1 : forall i : Fin n, IndepFun (fun ω => Y ω i) (D1 i) μ)
+    (hind2 : forall i : Fin n, IndepFun (fun ω => (Y ω i) ^ 2) (D2 i) μ)
+    (hrx : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (X ω i)| <=
+            (1 / 6 : Real) * L3 * |X ω i| ^ 3)
+    (hry : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (Y ω i)| <=
+            (1 / 6 : Real) * L3 * |Y ω i| ^ 3)
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => X ω i)) ω - ∫ ν, Y ν i ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω -
+          ∫ ν, (Y ν i) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n,
+      @thirdMomentContribution Ω mΩ n μ (coordinateProcess X) (coordinateProcess Y) i <= M3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      theoremOneOneBound
+        (@firstMomentError Ω mΩ n μ 𝓕 (coordinateProcess X) (coordinateProcess Y))
+        (@secondMomentError Ω mΩ n μ 𝓕 (coordinateProcess X) (coordinateProcess Y))
+        L1 L2 L3 M3 := by
+  apply theoremOneOne_probability_complete_interpolation
+    (Ω := Ω) (mΩ := mΩ) μ 𝓕 f X Y D1 D2
+    (fun i ω =>
+      coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+        (D1 i ω) (D2 i ω) (X ω i))
+    (fun i ω =>
+      coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+        (D1 i ω) (D2 i ω) (Y ω i))
+    L1 L2 L3 M3 hL3 h𝓕 hSigma hIntInterp
+  · exact hd1𝓕
+  · exact hd2𝓕
+  · exact hx
+  · exact hx2
+  · exact hx3
+  · exact hy3
+  · exact hxd1
+  · exact hyd1
+  · exact hx2d2
+  · exact hy2d2
+  · exact hrx_int
+  · exact hry_int
+  · exact hcxd1
+  · exact hcx2d2
+  · exact hconst1
+  · exact hconst2
+  · exact hy_ae
+  · exact hy2_ae
+  · exact hd1_ae
+  · exact hd2_ae
+  · exact hind1
+  · exact hind2
+  · exact hrx
+  · exact hry
+  · intro i
+    simpa using
+      lindeberg_step_ae_eq_coordinateTaylorRemainders
+        (Ω := Ω) (mΩ := mΩ) μ f X Y D1 D2 i
+  · exact hD1
+  · exact hD2
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+theorem theoremOneOne_probability_complete_interpolation_residual_enlarged
+    {n : Nat}
+    (μ : Measure Ω) (𝓕 𝓖 : Fin n -> MeasurableSpace Ω)
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (h𝓖 : forall i : Fin n, 𝓖 i <= mΩ)
+    (hSigma𝓖 : forall i : Fin n, SigmaFinite (μ.trim (h𝓖 i)))
+    (hIntInterp : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ)
+    (hd1𝓖 : forall i : Fin n, StronglyMeasurable[𝓖 i] (D1 i))
+    (hd2𝓖 : forall i : Fin n, StronglyMeasurable[𝓖 i] (D2 i))
+    (hx : forall i : Fin n, Integrable (fun ω => X ω i) μ)
+    (hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hxd1 : forall i : Fin n, Integrable (fun ω => X ω i * D1 i ω) μ)
+    (hyd1 : forall i : Fin n, Integrable (fun ω => Y ω i * D1 i ω) μ)
+    (hx2d2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2 * D2 i ω) μ)
+    (hy2d2 : forall i : Fin n, Integrable (fun ω => (Y ω i) ^ 2 * D2 i ω) μ)
+    (hrx_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (X ω i)) μ)
+    (hry_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (Y ω i)) μ)
+    (hcxd1 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => X ω i)) ω * D1 i ω) μ)
+    (hcx2d2 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω * D2 i ω) μ)
+    (hconst1 : forall i : Fin n, Integrable (fun ω => (∫ ν, Y ν i ∂μ) * D1 i ω) μ)
+    (hconst2 : forall i : Fin n,
+      Integrable (fun ω => (∫ ν, (Y ν i) ^ 2 ∂μ) * D2 i ω) μ)
+    (hy_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => Y ω i) μ)
+    (hy2_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => (Y ω i) ^ 2) μ)
+    (hd1_ae : forall i : Fin n, AEStronglyMeasurable (D1 i) μ)
+    (hd2_ae : forall i : Fin n, AEStronglyMeasurable (D2 i) μ)
+    (hind1 : forall i : Fin n, IndepFun (fun ω => Y ω i) (D1 i) μ)
+    (hind2 : forall i : Fin n, IndepFun (fun ω => (Y ω i) ^ 2) (D2 i) μ)
+    (hcond1 : forall i : Fin n,
+      (condExp (𝓖 i) μ (fun ω => X ω i)) =ᵐ[μ]
+        condExp (𝓕 i) μ (fun ω => X ω i))
+    (hcond2 : forall i : Fin n,
+      (condExp (𝓖 i) μ (fun ω => (X ω i) ^ 2)) =ᵐ[μ]
+        condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2))
+    (hrx : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (X ω i)| <=
+            (1 / 6 : Real) * L3 * |X ω i| ^ 3)
+    (hry : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (Y ω i)| <=
+            (1 / 6 : Real) * L3 * |Y ω i| ^ 3)
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => X ω i)) ω - ∫ ν, Y ν i ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω -
+          ∫ ν, (Y ν i) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n,
+      @thirdMomentContribution Ω mΩ n μ (coordinateProcess X) (coordinateProcess Y) i <= M3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      theoremOneOneBound
+        (@firstMomentError Ω mΩ n μ 𝓕 (coordinateProcess X) (coordinateProcess Y))
+        (@secondMomentError Ω mΩ n μ 𝓕 (coordinateProcess X) (coordinateProcess Y))
+        L1 L2 L3 M3 := by
+  apply theoremOneOne_probability
+    (Ω := Ω) (mΩ := mΩ) μ 𝓕
+    (∫ ω, f (X ω) ∂μ) (∫ ω, f (Y ω) ∂μ)
+    (fun i : Fin n =>
+      ∫ ω,
+        f (lindebergInterpolate X Y (i + 1) ω) -
+          f (lindebergInterpolate X Y i ω) ∂μ)
+    (coordinateProcess X) (coordinateProcess Y) D1 D2 L1 L2 L3 M3 hL3
+  · exact lindeberg_integral_telescope (Ω := Ω) (mΩ := mΩ) μ f X Y hIntInterp
+  · intro i
+    letI : SigmaFinite (μ.trim (h𝓖 i)) := hSigma𝓖 i
+    simpa [coordinateProcess, thirdMomentContribution] using
+      oneStep_taylor_condExp_estimate_complete_enlarged
+        (Ω := Ω) (mΩ := mΩ) (μ := μ) (𝓕 := 𝓕 i) (𝓖 := 𝓖 i) (h𝓖 i)
+        (fun ω => f (lindebergInterpolate X Y (i + 1) ω))
+        (fun ω => f (lindebergInterpolate X Y i ω))
+        (fun ω => X ω i) (fun ω => Y ω i) (D1 i) (D2 i)
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (X ω i))
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (Y ω i))
+        L3 (hd1𝓖 i) (hd2𝓖 i) (hx i) (hx2 i) (hx3 i) (hy3 i)
+        (hxd1 i) (hyd1 i) (hx2d2 i) (hy2d2 i) (hrx_int i) (hry_int i)
+        (hcxd1 i) (hcx2d2 i) (hconst1 i) (hconst2 i)
+        (hy_ae i) (hy2_ae i) (hd1_ae i) (hd2_ae i) (hind1 i) (hind2 i)
+        (hcond1 i) (hcond2 i) (hrx i) (hry i)
+        (by
+          simpa using
+            lindeberg_step_ae_eq_coordinateTaylorRemainders
+              (Ω := Ω) (mΩ := mΩ) μ f X Y D1 D2 i)
+  · exact hD1
+  · exact hD2
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+theorem theoremOneOne_probability_complete_interpolation_residual_of_indep_residuals
+    {n : Nat}
+    (μ : Measure Ω) (𝓕 𝓖 𝓗1 𝓗2 : Fin n -> MeasurableSpace Ω)
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (h𝓕 : forall i : Fin n, 𝓕 i <= mΩ)
+    (h𝓕𝓖 : forall i : Fin n, 𝓕 i <= 𝓖 i)
+    (h𝓖 : forall i : Fin n, 𝓖 i <= mΩ)
+    (h𝓗1 : forall i : Fin n, 𝓗1 i <= mΩ)
+    (h𝓗2 : forall i : Fin n, 𝓗2 i <= mΩ)
+    (hSigma𝓕 : forall i : Fin n, SigmaFinite (μ.trim (h𝓕 i)))
+    (hSigma𝓖 : forall i : Fin n, SigmaFinite (μ.trim (h𝓖 i)))
+    (hIntInterp : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ)
+    (hd1𝓖 : forall i : Fin n, StronglyMeasurable[𝓖 i] (D1 i))
+    (hd2𝓖 : forall i : Fin n, StronglyMeasurable[𝓖 i] (D2 i))
+    (hx : forall i : Fin n, Integrable (fun ω => X ω i) μ)
+    (hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hxd1 : forall i : Fin n, Integrable (fun ω => X ω i * D1 i ω) μ)
+    (hyd1 : forall i : Fin n, Integrable (fun ω => Y ω i * D1 i ω) μ)
+    (hx2d2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2 * D2 i ω) μ)
+    (hy2d2 : forall i : Fin n, Integrable (fun ω => (Y ω i) ^ 2 * D2 i ω) μ)
+    (hrx_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (X ω i)) μ)
+    (hry_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (Y ω i)) μ)
+    (hcxd1 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => X ω i)) ω * D1 i ω) μ)
+    (hcx2d2 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω * D2 i ω) μ)
+    (hconst1 : forall i : Fin n, Integrable (fun ω => (∫ ν, Y ν i ∂μ) * D1 i ω) μ)
+    (hconst2 : forall i : Fin n,
+      Integrable (fun ω => (∫ ν, (Y ν i) ^ 2 ∂μ) * D2 i ω) μ)
+    (hy_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => Y ω i) μ)
+    (hy2_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => (Y ω i) ^ 2) μ)
+    (hd1_ae : forall i : Fin n, AEStronglyMeasurable (D1 i) μ)
+    (hd2_ae : forall i : Fin n, AEStronglyMeasurable (D2 i) μ)
+    (hind1 : forall i : Fin n, IndepFun (fun ω => Y ω i) (D1 i) μ)
+    (hind2 : forall i : Fin n, IndepFun (fun ω => (Y ω i) ^ 2) (D2 i) μ)
+    (hres1 : forall i : Fin n,
+      StronglyMeasurable[𝓗1 i]
+        (fun ω => X ω i -
+          (condExp (𝓕 i) μ (fun ω => X ω i)) ω))
+    (hres2 : forall i : Fin n,
+      StronglyMeasurable[𝓗2 i]
+        (fun ω => (X ω i) ^ 2 -
+          (condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω))
+    (hind_res1 : forall i : Fin n, Indep (𝓗1 i) (𝓖 i) μ)
+    (hind_res2 : forall i : Fin n, Indep (𝓗2 i) (𝓖 i) μ)
+    (hrx : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (X ω i)| <=
+            (1 / 6 : Real) * L3 * |X ω i| ^ 3)
+    (hry : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (Y ω i)| <=
+            (1 / 6 : Real) * L3 * |Y ω i| ^ 3)
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => X ω i)) ω - ∫ ν, Y ν i ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (𝓕 i) μ (fun ω => (X ω i) ^ 2)) ω -
+          ∫ ν, (Y ν i) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n,
+      @thirdMomentContribution Ω mΩ n μ (coordinateProcess X) (coordinateProcess Y) i <= M3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      theoremOneOneBound
+        (@firstMomentError Ω mΩ n μ 𝓕 (coordinateProcess X) (coordinateProcess Y))
+        (@secondMomentError Ω mΩ n μ 𝓕 (coordinateProcess X) (coordinateProcess Y))
+        L1 L2 L3 M3 := by
+  apply theoremOneOne_probability_complete_interpolation_residual_enlarged
+    (Ω := Ω) (mΩ := mΩ) μ 𝓕 𝓖 f X Y D1 D2 L1 L2 L3 M3
+    hL3 h𝓖 hSigma𝓖 hIntInterp
+  · exact hd1𝓖
+  · exact hd2𝓖
+  · exact hx
+  · exact hx2
+  · exact hx3
+  · exact hy3
+  · exact hxd1
+  · exact hyd1
+  · exact hx2d2
+  · exact hy2d2
+  · exact hrx_int
+  · exact hry_int
+  · exact hcxd1
+  · exact hcx2d2
+  · exact hconst1
+  · exact hconst2
+  · exact hy_ae
+  · exact hy2_ae
+  · exact hd1_ae
+  · exact hd2_ae
+  · exact hind1
+  · exact hind2
+  · intro i
+    letI : SigmaFinite (μ.trim (h𝓕 i)) := hSigma𝓕 i
+    letI : SigmaFinite (μ.trim (h𝓖 i)) := hSigma𝓖 i
+    exact condExp_eq_condExp_of_indep_sub_condExp
+      (Ω := Ω) (mΩ := mΩ) (μ := μ)
+      (h𝓕 i) (h𝓕𝓖 i) (h𝓖 i) (h𝓗1 i)
+      (hres1 i) (hx i) (hind_res1 i)
+  · intro i
+    letI : SigmaFinite (μ.trim (h𝓕 i)) := hSigma𝓕 i
+    letI : SigmaFinite (μ.trim (h𝓖 i)) := hSigma𝓖 i
+    exact condExp_eq_condExp_of_indep_sub_condExp
+      (Ω := Ω) (mΩ := mΩ) (μ := μ)
+      (h𝓕 i) (h𝓕𝓖 i) (h𝓖 i) (h𝓗2 i)
+      (hres2 i) (hx2 i) (hind_res2 i)
+  · exact hrx
+  · exact hry
+  · exact hD1
+  · exact hD2
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+
+/--
+The preceding theorem specialized to the paper's past and frozen
+sigma-algebras.
+
+The first two error terms are now exactly the paper's `A_i` and `B_i`, where
+conditioning is on the sigma-algebra generated by the past coordinates
+`X_0, ..., X_{i-1}`.  The derivative factors are allowed to be measurable with
+respect to the frozen sigma-algebra generated by that past and by the future
+`Y` coordinates in `Z_i^0`.
+-/
+theorem theoremOneOne_probability_complete_interpolation_residual_past_frozen
+    {n : Nat}
+    (μ : Measure Ω) [IsFiniteMeasure μ]
+    (𝓗1 𝓗2 : Fin n -> MeasurableSpace Ω)
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (hX_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω i))
+    (hY_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => Y ω i))
+    (h𝓗1 : forall i : Fin n, 𝓗1 i <= mΩ)
+    (h𝓗2 : forall i : Fin n, 𝓗2 i <= mΩ)
+    (hIntInterp : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ)
+    (hd1_frozen : forall i : Fin n, StronglyMeasurable[frozenSigma X Y i] (D1 i))
+    (hd2_frozen : forall i : Fin n, StronglyMeasurable[frozenSigma X Y i] (D2 i))
+    (hx : forall i : Fin n, Integrable (fun ω => X ω i) μ)
+    (hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hxd1 : forall i : Fin n, Integrable (fun ω => X ω i * D1 i ω) μ)
+    (hyd1 : forall i : Fin n, Integrable (fun ω => Y ω i * D1 i ω) μ)
+    (hx2d2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2 * D2 i ω) μ)
+    (hy2d2 : forall i : Fin n, Integrable (fun ω => (Y ω i) ^ 2 * D2 i ω) μ)
+    (hrx_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (X ω i)) μ)
+    (hry_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (Y ω i)) μ)
+    (hcxd1 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (pastSigma X i) μ (fun ω => X ω i)) ω * D1 i ω) μ)
+    (hcx2d2 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω *
+            D2 i ω) μ)
+    (hconst1 : forall i : Fin n, Integrable (fun ω => (∫ ν, Y ν i ∂μ) * D1 i ω) μ)
+    (hconst2 : forall i : Fin n,
+      Integrable (fun ω => (∫ ν, (Y ν i) ^ 2 ∂μ) * D2 i ω) μ)
+    (hy_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => Y ω i) μ)
+    (hy2_ae : forall i : Fin n, AEStronglyMeasurable (fun ω => (Y ω i) ^ 2) μ)
+    (hd1_ae : forall i : Fin n, AEStronglyMeasurable (D1 i) μ)
+    (hd2_ae : forall i : Fin n, AEStronglyMeasurable (D2 i) μ)
+    (hind1 : forall i : Fin n, IndepFun (fun ω => Y ω i) (D1 i) μ)
+    (hind2 : forall i : Fin n, IndepFun (fun ω => (Y ω i) ^ 2) (D2 i) μ)
+    (hres1 : forall i : Fin n,
+      StronglyMeasurable[𝓗1 i]
+        (fun ω => X ω i -
+          (condExp (pastSigma X i) μ (fun ω => X ω i)) ω))
+    (hres2 : forall i : Fin n,
+      StronglyMeasurable[𝓗2 i]
+        (fun ω => (X ω i) ^ 2 -
+          (condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω))
+    (hind_res1 : forall i : Fin n, Indep (𝓗1 i) (frozenSigma X Y i) μ)
+    (hind_res2 : forall i : Fin n, Indep (𝓗2 i) (frozenSigma X Y i) μ)
+    (hrx : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (X ω i)| <=
+            (1 / 6 : Real) * L3 * |X ω i| ^ 3)
+    (hry : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (Y ω i)| <=
+            (1 / 6 : Real) * L3 * |Y ω i| ^ 3)
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (pastSigma X i) μ (fun ω => X ω i)) ω -
+          ∫ ν, Y ν i ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω -
+          ∫ ν, (Y ν i) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n,
+      @thirdMomentContribution Ω mΩ n μ (coordinateProcess X) (coordinateProcess Y) i <= M3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      theoremOneOneBound
+        (@firstMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+        (@secondMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+        L1 L2 L3 M3 := by
+  have hPast : forall i : Fin n, pastSigma X i <= mΩ := fun _ =>
+    pastSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+  have hFrozen : forall i : Fin n, frozenSigma X Y i <= mΩ := fun _ =>
+    frozenSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) (Y := Y) hX_meas hY_meas
+  have hPastFrozen : forall i : Fin n, pastSigma X i <= frozenSigma X Y i := fun i =>
+    pastSigma_le_frozenSigma X Y i
+  apply theoremOneOne_probability_complete_interpolation_residual_of_indep_residuals
+    (Ω := Ω) (mΩ := mΩ) μ (pastSigma X) (frozenSigma X Y) 𝓗1 𝓗2
+    f X Y D1 D2 L1 L2 L3 M3 hL3 hPast hPastFrozen hFrozen h𝓗1 h𝓗2
+  · exact fun _ => inferInstance
+  · exact fun _ => inferInstance
+  · exact hIntInterp
+  · exact hd1_frozen
+  · exact hd2_frozen
+  · exact hx
+  · exact hx2
+  · exact hx3
+  · exact hy3
+  · exact hxd1
+  · exact hyd1
+  · exact hx2d2
+  · exact hy2d2
+  · exact hrx_int
+  · exact hry_int
+  · exact hcxd1
+  · exact hcx2d2
+  · exact hconst1
+  · exact hconst2
+  · exact hy_ae
+  · exact hy2_ae
+  · exact hd1_ae
+  · exact hd2_ae
+  · exact hind1
+  · exact hind2
+  · exact hres1
+  · exact hres2
+  · exact hind_res1
+  · exact hind_res2
+  · exact hrx
+  · exact hry
+  · exact hD1
+  · exact hD2
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+
+/--
+The paper's past/frozen interpolation theorem with the two conditional
+expectation identifications derived from independence of the vectors `X` and
+`Y`.
+
+This removes the residual-independence hypotheses from
+`theoremOneOne_probability_complete_interpolation_residual_past_frozen`.  The
+remaining independence input `hy_indep_frozen` is the direct statement that each
+`Y_i` is independent of the frozen variables in its Lindeberg step.
+-/
+theorem theoremOneOne_probability_complete_interpolation_residual_past_frozen_of_indep_vectors
+    {n : Nat}
+    (μ : Measure Ω) [IsFiniteMeasure μ]
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (hX_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω i))
+    (hY_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => Y ω i))
+    (hindXY : Indep (vectorSigma X) (vectorSigma Y) μ)
+    (hy_indep_frozen : forall i : Fin n,
+      Indep (MeasurableSpace.comap (fun ω => Y ω i) (borel Real)) (frozenSigma X Y i) μ)
+    (hIntInterp : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ)
+    (hd1_frozen : forall i : Fin n, StronglyMeasurable[frozenSigma X Y i] (D1 i))
+    (hd2_frozen : forall i : Fin n, StronglyMeasurable[frozenSigma X Y i] (D2 i))
+    (hx : forall i : Fin n, Integrable (fun ω => X ω i) μ)
+    (hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hxd1 : forall i : Fin n, Integrable (fun ω => X ω i * D1 i ω) μ)
+    (hyd1 : forall i : Fin n, Integrable (fun ω => Y ω i * D1 i ω) μ)
+    (hx2d2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2 * D2 i ω) μ)
+    (hy2d2 : forall i : Fin n, Integrable (fun ω => (Y ω i) ^ 2 * D2 i ω) μ)
+    (hrx_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (X ω i)) μ)
+    (hry_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (Y ω i)) μ)
+    (hcxd1 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (pastSigma X i) μ (fun ω => X ω i)) ω * D1 i ω) μ)
+    (hcx2d2 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω *
+            D2 i ω) μ)
+    (hconst1 : forall i : Fin n, Integrable (fun ω => (∫ ν, Y ν i ∂μ) * D1 i ω) μ)
+    (hconst2 : forall i : Fin n,
+      Integrable (fun ω => (∫ ν, (Y ν i) ^ 2 ∂μ) * D2 i ω) μ)
+    (hrx : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (X ω i)| <=
+            (1 / 6 : Real) * L3 * |X ω i| ^ 3)
+    (hry : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (Y ω i)| <=
+            (1 / 6 : Real) * L3 * |Y ω i| ^ 3)
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (pastSigma X i) μ (fun ω => X ω i)) ω -
+          ∫ ν, Y ν i ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω -
+          ∫ ν, (Y ν i) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n,
+      @thirdMomentContribution Ω mΩ n μ (coordinateProcess X) (coordinateProcess Y) i <= M3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      theoremOneOneBound
+        (@firstMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+        (@secondMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+        L1 L2 L3 M3 := by
+  have hFrozen : forall i : Fin n, frozenSigma X Y i <= mΩ := fun _ =>
+    frozenSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) (Y := Y) hX_meas hY_meas
+  have hindY :
+      (forall i : Fin n, IndepFun (fun ω => Y ω i) (D1 i) μ) ∧
+        (forall i : Fin n, IndepFun (fun ω => (Y ω i) ^ 2) (D2 i) μ) :=
+    y_frozen_derivative_indepFun_of_indep_frozen
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (X := X) (Y := Y)
+      (D1 := D1) (D2 := D2) hy_indep_frozen hd1_frozen hd2_frozen
+  apply theoremOneOne_probability_complete_interpolation_residual_enlarged
+    (Ω := Ω) (mΩ := mΩ) μ (pastSigma X) (frozenSigma X Y)
+    f X Y D1 D2 L1 L2 L3 M3 hL3 hFrozen
+  · exact fun _ => inferInstance
+  · exact hIntInterp
+  · exact hd1_frozen
+  · exact hd2_frozen
+  · exact hx
+  · exact hx2
+  · exact hx3
+  · exact hy3
+  · exact hxd1
+  · exact hyd1
+  · exact hx2d2
+  · exact hy2d2
+  · exact hrx_int
+  · exact hry_int
+  · exact hcxd1
+  · exact hcx2d2
+  · exact hconst1
+  · exact hconst2
+  · intro i
+    exact (hY_meas i).aestronglyMeasurable
+  · intro i
+    exact ((hY_meas i).pow_const 2).aestronglyMeasurable
+  · intro i
+    exact ((hd1_frozen i).mono (hFrozen i)).aestronglyMeasurable
+  · intro i
+    exact ((hd2_frozen i).mono (hFrozen i)).aestronglyMeasurable
+  · exact hindY.1
+  · exact hindY.2
+  · intro i
+    exact condExp_frozenSigma_eq_pastSigma_of_indep_vectors
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (X := X) (Y := Y)
+      i hX_meas hY_meas hindXY (hx i)
+  · intro i
+    exact condExp_frozenSigma_sq_eq_pastSigma_of_indep_vectors
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (X := X) (Y := Y)
+      i hX_meas hY_meas hindXY (hx2 i)
+  · exact hrx
+  · exact hry
+  · exact hD1
+  · exact hD2
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+
+/--
+The same past/frozen theorem, but with the independence assumptions stated in
+the paper's form: the `X` vector is independent of the `Y` vector, and the
+coordinates of `Y` are mutually independent.  The auxiliary independence of
+`Y_i` from the frozen variables is derived by
+`y_coord_indep_frozenSigma_of_indep_vectors_iIndep`.
+-/
+theorem theoremOneOne_probability_complete_interpolation_residual_past_frozen_of_paper_independence
+    {n : Nat}
+    (μ : Measure Ω) [IsProbabilityMeasure μ]
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (D1 D2 : Fin n -> Ω -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (hX_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω i))
+    (hY_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => Y ω i))
+    (hindXY : Indep (vectorSigma X) (vectorSigma Y) μ)
+    (hY_indep : iIndep (fun i : Fin n =>
+      MeasurableSpace.comap (fun ω => Y ω i) (borel Real)) μ)
+    (hIntInterp : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ)
+    (hd1_frozen : forall i : Fin n, StronglyMeasurable[frozenSigma X Y i] (D1 i))
+    (hd2_frozen : forall i : Fin n, StronglyMeasurable[frozenSigma X Y i] (D2 i))
+    (hx : forall i : Fin n, Integrable (fun ω => X ω i) μ)
+    (hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hxd1 : forall i : Fin n, Integrable (fun ω => X ω i * D1 i ω) μ)
+    (hyd1 : forall i : Fin n, Integrable (fun ω => Y ω i * D1 i ω) μ)
+    (hx2d2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2 * D2 i ω) μ)
+    (hy2d2 : forall i : Fin n, Integrable (fun ω => (Y ω i) ^ 2 * D2 i ω) μ)
+    (hrx_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (X ω i)) μ)
+    (hry_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (D1 i ω) (D2 i ω) (Y ω i)) μ)
+    (hcxd1 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (pastSigma X i) μ (fun ω => X ω i)) ω * D1 i ω) μ)
+    (hcx2d2 : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          (condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω *
+            D2 i ω) μ)
+    (hconst1 : forall i : Fin n, Integrable (fun ω => (∫ ν, Y ν i ∂μ) * D1 i ω) μ)
+    (hconst2 : forall i : Fin n,
+      Integrable (fun ω => (∫ ν, (Y ν i) ^ 2 ∂μ) * D2 i ω) μ)
+    (hrx : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (X ω i)| <=
+            (1 / 6 : Real) * L3 * |X ω i| ^ 3)
+    (hry : forall i : Fin n,
+      ∀ᵐ ω ∂μ,
+        |coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+          (D1 i ω) (D2 i ω) (Y ω i)| <=
+            (1 / 6 : Real) * L3 * |Y ω i| ^ 3)
+    (hD1 : forall i : Fin n, ∀ᵐ ω ∂μ, |D1 i ω| <= L1)
+    (hD2 : forall i : Fin n, ∀ᵐ ω ∂μ, |D2 i ω| <= L2)
+    (hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (pastSigma X i) μ (fun ω => X ω i)) ω -
+          ∫ ν, Y ν i ∂μ|) μ)
+    (hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω -
+          ∫ ν, (Y ν i) ^ 2 ∂μ|) μ)
+    (hthird : forall i : Fin n,
+      @thirdMomentContribution Ω mΩ n μ (coordinateProcess X) (coordinateProcess Y) i <= M3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      theoremOneOneBound
+        (@firstMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+        (@secondMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+        L1 L2 L3 M3 := by
+  apply theoremOneOne_probability_complete_interpolation_residual_past_frozen_of_indep_vectors
+    (Ω := Ω) (mΩ := mΩ) μ f X Y D1 D2 L1 L2 L3 M3 hL3 hX_meas hY_meas hindXY
+  · intro i
+    exact y_coord_indep_frozenSigma_of_indep_vectors_iIndep
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (X := X) (Y := Y)
+      i hX_meas hY_meas hindXY hY_indep
+  · exact hIntInterp
+  · exact hd1_frozen
+  · exact hd2_frozen
+  · exact hx
+  · exact hx2
+  · exact hx3
+  · exact hy3
+  · exact hxd1
+  · exact hyd1
+  · exact hx2d2
+  · exact hy2d2
+  · exact hrx_int
+  · exact hry_int
+  · exact hcxd1
+  · exact hcx2d2
+  · exact hconst1
+  · exact hconst2
+  · exact hrx
+  · exact hry
+  · exact hD1
+  · exact hD2
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+
+/--
+The past/frozen theorem with the Taylor remainders discharged from the paper's
+ordinary coordinate-derivative bounds.  The derivative factors are no longer
+arbitrary functions: they are `∂ᵢ f(Zᵢ⁰)` and `∂ᵢ² f(Zᵢ⁰)`, encoded as
+`frozenCoordinateDerivative 1` and `frozenCoordinateDerivative 2`.
+-/
+theorem theoremOneOne_probability_complete_interpolation_exact_taylor_of_paper_independence
+    {n : Nat}
+    (μ : Measure Ω) [IsProbabilityMeasure μ]
+    (f : (Fin n -> Real) -> Real) (X Y : Ω -> Fin n -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hL3 : 0 <= L3)
+    (hf : ContDiff Real 3 f)
+    (hL1_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 1 f x i| <= L1)
+    (hL2_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 2 f x i| <= L2)
+    (hL3_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 3 f x i| <= L3)
+    (hX_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω i))
+    (hY_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => Y ω i))
+    (hindXY : Indep (vectorSigma X) (vectorSigma Y) μ)
+    (hY_indep : iIndep (fun i : Fin n =>
+      MeasurableSpace.comap (fun ω => Y ω i) (borel Real)) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hthird : forall i : Fin n,
+      @thirdMomentContribution Ω mΩ n μ (coordinateProcess X) (coordinateProcess Y) i <= M3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      theoremOneOneBound
+        (@firstMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+        (@secondMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+        L1 L2 L3 M3 := by
+  have hFrozen : forall i : Fin n, frozenSigma X Y i <= mΩ := fun _ =>
+    frozenSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) (Y := Y) hX_meas hY_meas
+  have hd1_frozen : forall i : Fin n,
+      StronglyMeasurable[frozenSigma X Y i] (frozenCoordinateDerivative 1 f X Y i) := by
+    intro i
+    exact frozenCoordinateDerivative_one_stronglyMeasurable
+      (Ω := Ω) (f := f) (X := X) (Y := Y) i (hf.of_le (by norm_num))
+  have hd2_frozen : forall i : Fin n,
+      StronglyMeasurable[frozenSigma X Y i] (frozenCoordinateDerivative 2 f X Y i) := by
+    intro i
+    exact frozenCoordinateDerivative_two_stronglyMeasurable
+      (Ω := Ω) (f := f) (X := X) (Y := Y) i (hf.of_le (by norm_num))
+  have hd1_ae : forall i : Fin n,
+      AEStronglyMeasurable (frozenCoordinateDerivative 1 f X Y i) μ := fun i =>
+    ((hd1_frozen i).mono (hFrozen i)).aestronglyMeasurable
+  have hd2_ae : forall i : Fin n,
+      AEStronglyMeasurable (frozenCoordinateDerivative 2 f X Y i) μ := fun i =>
+    ((hd2_frozen i).mono (hFrozen i)).aestronglyMeasurable
+  have hD1_bound : forall (z : Fin n -> Real) (i : Fin n),
+      |coordinateDerivative 1 f z i| <= L1 := by
+    intro z i
+    rw [coordinateDerivative_eq_coordinatePartialDerivative_update_zero]
+    exact hL1_bound i (Function.update z i 0)
+  have hD2_bound : forall (z : Fin n -> Real) (i : Fin n),
+      |coordinateDerivative 2 f z i| <= L2 := by
+    intro z i
+    rw [coordinateDerivative_eq_coordinatePartialDerivative_update_zero]
+    exact hL2_bound i (Function.update z i 0)
+  have hD3_bound : forall (z : Fin n -> Real) (i : Fin n) (t : Real),
+      |iteratedDeriv 3 (coordinateSlice f z i) t| <= L3 := by
+    intro z i t
+    rw [iteratedDeriv_coordinateSlice_eq_coordinatePartialDerivative_update]
+    exact hL3_bound i (Function.update z i t)
+  have hD1_norm : forall i : Fin n,
+      ∀ᵐ ω ∂μ, ‖frozenCoordinateDerivative 1 f X Y i ω‖ <= L1 := fun i =>
+    Filter.Eventually.of_forall fun ω => by
+      simpa [Real.norm_eq_abs, frozenCoordinateDerivative, coordinateDerivative] using
+        hD1_bound (lindebergFrozen X Y i ω) i
+  have hD2_norm : forall i : Fin n,
+      ∀ᵐ ω ∂μ, ‖frozenCoordinateDerivative 2 f X Y i ω‖ <= L2 := fun i =>
+    Filter.Eventually.of_forall fun ω => by
+      simpa [Real.norm_eq_abs, frozenCoordinateDerivative, coordinateDerivative] using
+        hD2_bound (lindebergFrozen X Y i ω) i
+  have hD1_int : forall i : Fin n,
+      Integrable (frozenCoordinateDerivative 1 f X Y i) μ := by
+    intro i
+    exact ⟨hd1_ae i, HasFiniteIntegral.of_bounded (hD1_norm i)⟩
+  have hD2_int : forall i : Fin n,
+      Integrable (frozenCoordinateDerivative 2 f X Y i) μ := by
+    intro i
+    exact ⟨hd2_ae i, HasFiniteIntegral.of_bounded (hD2_norm i)⟩
+  have hx : forall i : Fin n, Integrable (fun ω => X ω i) μ := fun i =>
+    integrable_of_integrable_abs_cube
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (x := fun ω => X ω i)
+      (hX_meas i).aestronglyMeasurable (hx3 i)
+  have hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ := fun i =>
+    integrable_sq_of_integrable_abs_cube
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (x := fun ω => X ω i)
+      (hX_meas i).aestronglyMeasurable (hx3 i)
+  have hy : forall i : Fin n, Integrable (fun ω => Y ω i) μ := fun i =>
+    integrable_of_integrable_abs_cube
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (x := fun ω => Y ω i)
+      (hY_meas i).aestronglyMeasurable (hy3 i)
+  have hy2 : forall i : Fin n, Integrable (fun ω => (Y ω i) ^ 2) μ := fun i =>
+    integrable_sq_of_integrable_abs_cube
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (x := fun ω => Y ω i)
+      (hY_meas i).aestronglyMeasurable (hy3 i)
+  have hIntInterp : forall k : Nat, k <= n ->
+      Integrable (fun ω => f (lindebergInterpolate X Y k ω)) μ := by
+    intro k _hk
+    exact integrable_f_apply_of_integrable_abs_coords
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (f := f)
+      (Z := fun ω => lindebergInterpolate X Y k ω) (L1 := L1)
+      (hf.of_le (by norm_num)) hL1_bound
+      (lindebergInterpolate_measurable (Ω := Ω) (X := X) (Y := Y) k hX_meas hY_meas)
+      (fun i => by
+        by_cases hi : (i : Nat) < k
+        · simpa [lindebergInterpolate, hi] using (hx i).abs
+        · simpa [lindebergInterpolate, hi] using (hy i).abs)
+  have hInt1 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (pastSigma X i) μ (fun ω => X ω i)) ω -
+          ∫ ν, Y ν i ∂μ|) μ := by
+    intro i
+    have hcx : Integrable (condExp (pastSigma X i) μ (fun ω => X ω i)) μ :=
+      integrable_condExp
+    exact (hcx.sub (integrable_const (∫ ν, Y ν i ∂μ))).abs
+  have hInt2 : forall i : Fin n,
+      Integrable (fun ω =>
+        |(condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω -
+          ∫ ν, (Y ν i) ^ 2 ∂μ|) μ := by
+    intro i
+    have hcx2 :
+        Integrable (condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) μ :=
+      integrable_condExp
+    exact (hcx2.sub (integrable_const (∫ ν, (Y ν i) ^ 2 ∂μ))).abs
+  have hFrozen_meas : forall i : Fin n, Measurable (fun ω => lindebergFrozen X Y i ω) := by
+    intro i
+    exact ((lindebergFrozen_measurable_frozenSigma X Y i).mono le_rfl pi_le_borel_pi).mono
+      (hFrozen i) le_rfl
+  have hrx_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (frozenCoordinateDerivative 1 f X Y i ω)
+            (frozenCoordinateDerivative 2 f X Y i ω) (X ω i)) μ := by
+    intro i
+    simpa [frozenCoordinateDerivative] using
+      coordinateTaylorRemainder_integrable_of_bound
+        (Ω := Ω) (mΩ := mΩ) (μ := μ) (f := f)
+        (Z := fun ω => lindebergFrozen X Y i ω) (x := fun ω => X ω i)
+        (i := i) (L3 := L3) hf hD3_bound (hFrozen_meas i)
+        (fun ω => lindebergFrozen_self X Y i ω) (hX_meas i) (hx3 i)
+        (hd1_ae i) (hd2_ae i)
+  have hry_int : forall i : Fin n,
+      Integrable
+        (fun ω =>
+          coordinateTaylorRemainder f (lindebergFrozen X Y i ω) i
+            (frozenCoordinateDerivative 1 f X Y i ω)
+            (frozenCoordinateDerivative 2 f X Y i ω) (Y ω i)) μ := by
+    intro i
+    simpa [frozenCoordinateDerivative] using
+      coordinateTaylorRemainder_integrable_of_bound
+        (Ω := Ω) (mΩ := mΩ) (μ := μ) (f := f)
+        (Z := fun ω => lindebergFrozen X Y i ω) (x := fun ω => Y ω i)
+        (i := i) (L3 := L3) hf hD3_bound (hFrozen_meas i)
+        (fun ω => lindebergFrozen_self X Y i ω) (hY_meas i) (hy3 i)
+        (hd1_ae i) (hd2_ae i)
+  apply theoremOneOne_probability_complete_interpolation_residual_past_frozen_of_paper_independence
+    (Ω := Ω) (mΩ := mΩ) μ f X Y
+    (frozenCoordinateDerivative 1 f X Y)
+    (frozenCoordinateDerivative 2 f X Y)
+    L1 L2 L3 M3 hL3 hX_meas hY_meas hindXY hY_indep
+  · exact hIntInterp
+  · exact hd1_frozen
+  · exact hd2_frozen
+  · exact hx
+  · exact hx2
+  · exact hx3
+  · exact hy3
+  · intro i
+    have hprod := (hx i).bdd_mul (hd1_ae i) (hD1_norm i)
+    simpa [mul_comm] using hprod
+  · intro i
+    have hprod := (hy i).bdd_mul (hd1_ae i) (hD1_norm i)
+    simpa [mul_comm] using hprod
+  · intro i
+    have hprod := (hx2 i).bdd_mul (hd2_ae i) (hD2_norm i)
+    simpa [mul_comm] using hprod
+  · intro i
+    have hprod := (hy2 i).bdd_mul (hd2_ae i) (hD2_norm i)
+    simpa [mul_comm] using hprod
+  · exact hrx_int
+  · exact hry_int
+  · intro i
+    have hcx : Integrable (condExp (pastSigma X i) μ (fun ω => X ω i)) μ :=
+      integrable_condExp
+    have hprod := hcx.bdd_mul (hd1_ae i) (hD1_norm i)
+    simpa [mul_comm] using hprod
+  · intro i
+    have hcx2 :
+        Integrable (condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) μ :=
+      integrable_condExp
+    have hprod := hcx2.bdd_mul (hd2_ae i) (hD2_norm i)
+    simpa [mul_comm] using hprod
+  · intro i
+    exact (hD1_int i).const_mul (∫ ν, Y ν i ∂μ)
+  · intro i
+    exact (hD2_int i).const_mul (∫ ν, (Y ν i) ^ 2 ∂μ)
+  · intro i
+    exact Filter.Eventually.of_forall fun ω => by
+      simpa [frozenCoordinateDerivative, coordinateDerivative] using
+        coordinateTaylorRemainder_bound
+          (f := f) (z := lindebergFrozen X Y i ω) (i := i)
+          (x := X ω i) (L3 := L3) hf hD3_bound
+  · intro i
+    exact Filter.Eventually.of_forall fun ω => by
+      simpa [frozenCoordinateDerivative, coordinateDerivative] using
+        coordinateTaylorRemainder_bound
+          (f := f) (z := lindebergFrozen X Y i ω) (i := i)
+          (x := Y ω i) (L3 := L3) hf hD3_bound
+  · intro i
+    exact Filter.Eventually.of_forall fun ω => by
+      simpa [frozenCoordinateDerivative, coordinateDerivative] using
+        hD1_bound (lindebergFrozen X Y i ω) i
+  · intro i
+    exact Filter.Eventually.of_forall fun ω => by
+      simpa [frozenCoordinateDerivative, coordinateDerivative] using
+        hD2_bound (lindebergFrozen X Y i ω) i
+  · exact hInt1
+  · exact hInt2
+  · exact hthird
+theorem iIndep_comap_measurePreserving
+    {Α Β ι : Type*} [mΑ : MeasurableSpace Α] [mΒ : MeasurableSpace Β]
+    {μΑ : Measure Α} {μΒ : Measure Β} {g : Α -> Β}
+    (hg : MeasurePreserving g μΑ μΒ)
+    {m : ι -> MeasurableSpace Β}
+    (hm_le : forall i, m i <= mΒ)
+    (hm : iIndep m μΒ) :
+    iIndep (fun i => MeasurableSpace.comap g (m i)) μΑ := by
+  letI : MeasurableSpace Α := mΑ
+  letI : MeasurableSpace Β := mΒ
+  classical
+  rw [iIndep_iff]
+  intro S s hs
+  have hchoose :
+      forall i : ι, exists t : Set Β,
+        MeasurableSet[m i] t ∧ (i ∈ S -> g ⁻¹' t = s i) := by
+    intro i
+    by_cases hi : i ∈ S
+    · rcases hs i hi with ⟨t, ht, hts⟩
+      exact ⟨t, ht, fun _ => hts⟩
+    · exact ⟨Set.univ, MeasurableSet.univ, fun h => False.elim (hi h)⟩
+  choose t ht using hchoose
+  have hpre : (⋂ i ∈ S, s i) = g ⁻¹' (⋂ i ∈ S, t i) := by
+    ext a
+    simp only [Set.mem_iInter, Set.mem_preimage]
+    constructor
+    · intro ha i hi
+      have hti := (ht i).2 hi
+      change a ∈ g ⁻¹' t i
+      rw [hti]
+      exact ha i hi
+    · intro ha i hi
+      have hti := (ht i).2 hi
+      rw [← hti]
+      exact ha i hi
+  have hmeas_inter : MeasurableSet[mΒ] (⋂ i ∈ S, t i) := by
+    exact S.measurableSet_biInter (fun i _ => hm_le i _ (ht i).1)
+  calc
+    μΑ (⋂ i ∈ S, s i)
+        = μΑ (g ⁻¹' (⋂ i ∈ S, t i)) := by rw [hpre]
+    _ = Measure.map g μΑ (⋂ i ∈ S, t i) := by
+          exact (Measure.map_apply hg.measurable hmeas_inter).symm
+    _ = μΒ (⋂ i ∈ S, t i) := by rw [hg.map_eq]
+    _ = ∏ i ∈ S, μΒ (t i) := by
+          exact hm.meas_biInter (fun i _ => (ht i).1)
+    _ = ∏ i ∈ S, μΑ (s i) := by
+          refine Finset.prod_congr rfl ?_
+          intro i hi
+          have hti := (ht i).2 hi
+          calc
+            μΒ (t i) = Measure.map g μΑ (t i) := by rw [hg.map_eq]
+            _ = μΑ (g ⁻¹' t i) := Measure.map_apply hg.measurable (hm_le i _ ((ht i).1))
+            _ = μΑ (s i) := by rw [hti]
+
+/--
+Conditional expectation commutes with pulling both the function and the
+conditioning sigma-algebra back along a measure-preserving map.
+-/
+theorem condExp_comap_measurePreserving_ae_eq
+    {Α Β : Type*} [mΑ : MeasurableSpace Α] [mΒ : MeasurableSpace Β]
+    {μΑ : Measure Α} {μΒ : Measure Β} [IsFiniteMeasure μΑ] [IsFiniteMeasure μΒ]
+    {g : Α -> Β} (hg : MeasurePreserving g μΑ μΒ)
+    (𝓕 : MeasurableSpace Β) (h𝓕 : 𝓕 <= mΒ)
+    {u : Β -> Real} (hu : Integrable u μΒ) :
+    (condExp (MeasurableSpace.comap g 𝓕) μΑ (fun a => u (g a))) =ᵐ[μΑ]
+      fun a => (condExp 𝓕 μΒ u) (g a) := by
+  letI : MeasurableSpace Α := mΑ
+  letI : MeasurableSpace Β := mΒ
+  let c : Β -> Real := condExp 𝓕 μΒ u
+  have hmΑ : MeasurableSpace.comap g 𝓕 <= mΑ := by
+    intro s hs
+    rcases hs with ⟨t, ht, rfl⟩
+    exact (h𝓕 t ht).preimage hg.measurable
+  have hu_comp : Integrable (fun a => u (g a)) μΑ := by
+    simpa [Function.comp_def] using (hg.integrable_comp hu.1).2 hu
+  have hcond_intΒ : Integrable c μΒ := by
+    dsimp [c]
+    exact integrable_condExp
+  have hcond_intΑ : Integrable (fun a => c (g a)) μΑ := by
+    simpa [Function.comp_def] using (hg.integrable_comp hcond_intΒ.1).2 hcond_intΒ
+  have hcond_sm : StronglyMeasurable[𝓕] c := by
+    dsimp [c]
+    exact stronglyMeasurable_condExp
+  have hgm : StronglyMeasurable[MeasurableSpace.comap g 𝓕] (fun a => c (g a)) := by
+    simpa [Function.comp_def] using hcond_sm.comp_measurable (comap_measurable g)
+  have hceq :
+      (fun a => c (g a)) =ᵐ[μΑ]
+        condExp (MeasurableSpace.comap g 𝓕) μΑ (fun a => u (g a)) := by
+    refine ae_eq_condExp_of_forall_setIntegral_eq hmΑ hu_comp ?_ ?_ ?_
+    · intro s _ _
+      exact hcond_intΑ.integrableOn
+    · intro s hs _
+      rcases hs with ⟨t, ht, rfl⟩
+      have htΒ : MeasurableSet[mΒ] t := h𝓕 t ht
+      have hmap_cond := setIntegral_map (μ := μΑ) (g := g)
+        (f := c) (s := t) htΒ
+        (by simpa [hg.map_eq] using hcond_intΒ.1) hg.aemeasurable
+      have hmap_u := setIntegral_map (μ := μΑ) (g := g)
+        (f := u) (s := t) htΒ
+        (by simpa [hg.map_eq] using hu.1) hg.aemeasurable
+      calc
+        ∫ a in g ⁻¹' t, c (g a) ∂μΑ
+            = ∫ b in t, c b ∂μΒ := by
+              simpa [hg.map_eq] using hmap_cond.symm
+        _ = ∫ b in t, u b ∂μΒ := by
+              dsimp [c]
+              exact setIntegral_condExp h𝓕 hu ht
+        _ = ∫ a in g ⁻¹' t, u (g a) ∂μΑ := by
+              simpa [hg.map_eq] using hmap_u
+    · exact hgm.aestronglyMeasurable
+  simpa [c] using hceq.symm
+theorem vectorSigma_prod_fst_le {n : Nat}
+    {X : Ω -> Fin n -> Real}
+    (hX : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω i)) :
+    @vectorSigma (Ω × Ω) n (fun p i => X p.1 i) <=
+      MeasurableSpace.comap Prod.fst mΩ := by
+  classical
+  rw [vectorSigma]
+  exact iSup_le fun i => by
+    intro s hs
+    rcases hs with ⟨t, ht, rfl⟩
+    exact ⟨(fun ω => X ω i) ⁻¹' t, (hX i) ht, rfl⟩
+
+/-- The coordinate sigma-algebra of a second-coordinate lift is below the second projection. -/
+theorem vectorSigma_prod_snd_le {n : Nat}
+    {Y : Ω -> Fin n -> Real}
+    (hY : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => Y ω i)) :
+    @vectorSigma (Ω × Ω) n (fun p i => Y p.2 i) <=
+      MeasurableSpace.comap Prod.snd mΩ := by
+  classical
+  rw [vectorSigma]
+  exact iSup_le fun i => by
+    intro s hs
+    rcases hs with ⟨t, ht, rfl⟩
+    exact ⟨(fun ω => Y ω i) ⁻¹' t, (hY i) ht, rfl⟩
+
+/-- The past sigma-algebra of a first-coordinate lift is the pullback of the original past. -/
+theorem pastSigma_prod_fst {n : Nat} (X : Ω -> Fin n -> Real) (i : Fin n) :
+    @pastSigma (Ω × Ω) n (fun p j => X p.1 j) i =
+      MeasurableSpace.comap Prod.fst (pastSigma X i) := by
+  classical
+  simp [pastSigma, MeasurableSpace.comap_iSup, MeasurableSpace.comap_comp,
+    Function.comp_def]
+
+/-- The first projection and second projection are independent on a product probability space. -/
+theorem indep_fst_snd_prod
+    {Α Β : Type*} [mΑ : MeasurableSpace Α] [mΒ : MeasurableSpace Β]
+    (μΑ : Measure Α) (μΒ : Measure Β) [IsProbabilityMeasure μΑ] [IsProbabilityMeasure μΒ] :
+    Indep (MeasurableSpace.comap (fun p : Α × Β => p.1) mΑ)
+      (MeasurableSpace.comap (fun p : Α × Β => p.2) mΒ) (μΑ.prod μΒ) := by
+  have hfun : IndepFun (fun p : Α × Β => p.1) (fun p : Α × Β => p.2) (μΑ.prod μΒ) := by
+    rw [indepFun_iff_map_prod_eq_prod_map_map measurable_fst.aemeasurable
+      measurable_snd.aemeasurable]
+    ext s _
+    simp
+  simpa [IndepFun_iff_Indep] using hfun
+
+/-- The first projection from a product with a probability factor is measure-preserving. -/
+theorem measurePreserving_fst_prod
+    (μ : Measure Ω) [IsProbabilityMeasure μ] :
+    MeasurePreserving (fun p : Ω × Ω => p.1) (μ.prod μ) μ := by
+  exact ⟨measurable_fst, by simp⟩
+
+/-- The second projection from a product with a probability factor is measure-preserving. -/
+theorem measurePreserving_snd_prod
+    (μ : Measure Ω) [IsProbabilityMeasure μ] :
+    MeasurePreserving (fun p : Ω × Ω => p.2) (μ.prod μ) μ := by
+  exact ⟨measurable_snd, by simp⟩
+
+/-! ### Error Transfer -/
+
+/-- The `A_i` term is unchanged by the independent product coupling. -/
+theorem firstMomentError_prod_eq {n : Nat}
+    (μ : Measure Ω) [IsProbabilityMeasure μ]
+    (X Y : Ω -> Fin n -> Real) (i : Fin n)
+    (hX_meas : forall j : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω j))
+    (hx : Integrable (fun ω => X ω i) μ) :
+    @firstMomentError (Ω × Ω) _ n (μ.prod μ)
+        (@pastSigma (Ω × Ω) n (fun p j => X p.1 j))
+        (coordinateProcess (fun p j => X p.1 j))
+        (coordinateProcess (fun p j => Y p.2 j)) i =
+      @firstMomentError Ω mΩ n μ (pastSigma X)
+        (coordinateProcess X) (coordinateProcess Y) i := by
+  have hPast : pastSigma X i <= mΩ :=
+    pastSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+  have hcond := condExp_comap_measurePreserving_ae_eq
+    (Α := Ω × Ω) (Β := Ω) (μΑ := μ.prod μ) (μΒ := μ)
+    (g := fun p : Ω × Ω => p.1) (measurePreserving_fst_prod (Ω := Ω) μ)
+    (pastSigma X i) hPast hx
+  have hpast := pastSigma_prod_fst (Ω := Ω) X i
+  have hYint :
+      (∫ p : Ω × Ω, Y p.2 i ∂(μ.prod μ)) = ∫ ω, Y ω i ∂μ := by
+    simpa using (integral_fun_snd (μ := μ) (ν := μ) (f := fun ω => Y ω i))
+  unfold firstMomentError coordinateProcess
+  rw [hpast]
+  calc
+    ∫ p : Ω × Ω,
+        |(condExp (MeasurableSpace.comap Prod.fst (pastSigma X i))
+            (μ.prod μ) (fun p : Ω × Ω => X p.1 i)) p -
+          ∫ p : Ω × Ω, Y p.2 i ∂(μ.prod μ)| ∂(μ.prod μ)
+        = ∫ p : Ω × Ω,
+            |(condExp (pastSigma X i) μ (fun ω => X ω i)) p.1 -
+              ∫ ω, Y ω i ∂μ| ∂(μ.prod μ) := by
+          apply integral_congr_ae
+          filter_upwards [hcond] with p hp
+          rw [hp, hYint]
+    _ = ∫ ω,
+          |(condExp (pastSigma X i) μ (fun ω => X ω i)) ω -
+            ∫ ν, Y ν i ∂μ| ∂μ := by
+          simpa using (integral_fun_fst (μ := μ) (ν := μ)
+            (f := fun ω =>
+              |(condExp (pastSigma X i) μ (fun ω => X ω i)) ω -
+                ∫ ν, Y ν i ∂μ|))
+
+/-- The `B_i` term is unchanged by the independent product coupling. -/
+theorem secondMomentError_prod_eq {n : Nat}
+    (μ : Measure Ω) [IsProbabilityMeasure μ]
+    (X Y : Ω -> Fin n -> Real) (i : Fin n)
+    (hX_meas : forall j : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω j))
+    (hx2 : Integrable (fun ω => (X ω i) ^ 2) μ) :
+    @secondMomentError (Ω × Ω) _ n (μ.prod μ)
+        (@pastSigma (Ω × Ω) n (fun p j => X p.1 j))
+        (coordinateProcess (fun p j => X p.1 j))
+        (coordinateProcess (fun p j => Y p.2 j)) i =
+      @secondMomentError Ω mΩ n μ (pastSigma X)
+        (coordinateProcess X) (coordinateProcess Y) i := by
+  have hPast : pastSigma X i <= mΩ :=
+    pastSigma_le (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+  have hcond := condExp_comap_measurePreserving_ae_eq
+    (Α := Ω × Ω) (Β := Ω) (μΑ := μ.prod μ) (μΒ := μ)
+    (g := fun p : Ω × Ω => p.1) (measurePreserving_fst_prod (Ω := Ω) μ)
+    (pastSigma X i) hPast hx2
+  have hpast := pastSigma_prod_fst (Ω := Ω) X i
+  have hYint :
+      (∫ p : Ω × Ω, (Y p.2 i) ^ 2 ∂(μ.prod μ)) =
+        ∫ ω, (Y ω i) ^ 2 ∂μ := by
+    simpa using (integral_fun_snd (μ := μ) (ν := μ) (f := fun ω => (Y ω i) ^ 2))
+  unfold secondMomentError coordinateProcess
+  rw [hpast]
+  calc
+    ∫ p : Ω × Ω,
+        |(condExp (MeasurableSpace.comap Prod.fst (pastSigma X i))
+            (μ.prod μ) (fun p : Ω × Ω => (X p.1 i) ^ 2)) p -
+          ∫ p : Ω × Ω, (Y p.2 i) ^ 2 ∂(μ.prod μ)| ∂(μ.prod μ)
+        = ∫ p : Ω × Ω,
+            |(condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) p.1 -
+              ∫ ω, (Y ω i) ^ 2 ∂μ| ∂(μ.prod μ) := by
+          apply integral_congr_ae
+          filter_upwards [hcond] with p hp
+          rw [hp, hYint]
+    _ = ∫ ω,
+          |(condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω -
+            ∫ ν, (Y ν i) ^ 2 ∂μ| ∂μ := by
+          simpa using (integral_fun_fst (μ := μ) (ν := μ)
+            (f := fun ω =>
+              |(condExp (pastSigma X i) μ (fun ω => (X ω i) ^ 2)) ω -
+                ∫ ν, (Y ν i) ^ 2 ∂μ|))
+
+/-! ### Independent-Coupling Engine -/
+
+/--
+Internal engine for the product-coupling proof of Theorem 1.1.
+
+This theorem has the displayed right-hand side of the paper, with
+`firstMomentError μ (pastSigma X) ... i` as `A_i` and
+`secondMomentError μ (pastSigma X) ... i` as `B_i`, but it assumes the auxiliary
+independent coupling `hindXY`.  The public theorem below removes that auxiliary
+assumption by applying this result on `Ω × Ω`.
+-/
+theorem theoremOneOne_paper_statement_independent_coupling
+    {n : Nat}
+    (μ : Measure Ω) [IsProbabilityMeasure μ]
+    (X Y : Ω -> Fin n -> Real)
+    (f : (Fin n -> Real) -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hX_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω i))
+    (hY_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => Y ω i))
+    (hindXY : Indep (vectorSigma X) (vectorSigma Y) μ)
+    (hY_indep : iIndep (fun i : Fin n =>
+      MeasurableSpace.comap (fun ω => Y ω i) (borel Real)) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hM3 : forall i : Fin n,
+      (∫ ω, |X ω i| ^ 3 ∂μ) + ∫ ω, |Y ω i| ^ 3 ∂μ <= M3)
+    (hf : ContDiff Real 3 f)
+    (hL1_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 1 f x i| <= L1)
+    (hL2_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 2 f x i| <= L2)
+    (hL3_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 3 f x i| <= L3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      (Finset.univ.sum fun i : Fin n =>
+        @firstMomentError Ω mΩ n μ (pastSigma X)
+            (coordinateProcess X) (coordinateProcess Y) i * L1 +
+          (1 / 2 : Real) *
+            @secondMomentError Ω mΩ n μ (pastSigma X)
+              (coordinateProcess X) (coordinateProcess Y) i * L2) +
+        (1 / 6 : Real) * (n : Real) * L3 * M3 := by
+  by_cases hn : n = 0
+  · subst n
+    have hfun : (fun ω => f (X ω)) = fun ω => f (Y ω) := by
+      funext ω
+      congr 1
+      ext i
+      exact Fin.elim0 i
+    simp [hfun]
+  have hL3_nonneg : 0 <= L3 := by
+    have hpos : 0 < n := Nat.pos_of_ne_zero hn
+    have hb := hL3_bound ⟨0, hpos⟩ (fun _ => 0)
+    exact le_trans (abs_nonneg _) hb
+  have hmain :
+      abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+        theoremOneOneBound
+          (@firstMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+          (@secondMomentError Ω mΩ n μ (pastSigma X) (coordinateProcess X) (coordinateProcess Y))
+          L1 L2 L3 M3 := by
+    apply theoremOneOne_probability_complete_interpolation_exact_taylor_of_paper_independence
+      (Ω := Ω) (mΩ := mΩ) μ f X Y L1 L2 L3 M3
+      hL3_nonneg hf hL1_bound hL2_bound hL3_bound
+      hX_meas hY_meas hindXY hY_indep
+      hx3 hy3
+    intro i
+    simpa [thirdMomentContribution, coordinateProcess] using hM3 i
+  simpa [theoremOneOneBound, div_eq_mul_inv, mul_assoc, mul_left_comm, mul_comm] using hmain
+
+/-! ### Public Theorem -/
+
+/--
+Theorem 1.1 in the paper's form, with no auxiliary independence assumption
+between `X` and `Y`.
+
+The proof applies the independent-coupling theorem on the product probability
+space, with `X` on the first coordinate and `Y` on the second, then identifies
+the product-space conditional moment errors with the original `A_i` and `B_i`.
+The only independence hypothesis is mutual independence of the coordinates of
+`Y`, matching the theorem statement formalized here.
+-/
+theorem theoremOneOne_paper_statement
+    {n : Nat}
+    (μ : Measure Ω) [IsProbabilityMeasure μ]
+    (X Y : Ω -> Fin n -> Real)
+    (f : (Fin n -> Real) -> Real)
+    (L1 L2 L3 M3 : Real)
+    (hX_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => X ω i))
+    (hY_meas : forall i : Fin n, @Measurable Ω Real mΩ (borel Real) (fun ω => Y ω i))
+    (hY_indep : iIndep (fun i : Fin n =>
+      MeasurableSpace.comap (fun ω => Y ω i) (borel Real)) μ)
+    (hx3 : forall i : Fin n, Integrable (fun ω => |X ω i| ^ 3) μ)
+    (hy3 : forall i : Fin n, Integrable (fun ω => |Y ω i| ^ 3) μ)
+    (hM3 : forall i : Fin n,
+      (∫ ω, |X ω i| ^ 3 ∂μ) + ∫ ω, |Y ω i| ^ 3 ∂μ <= M3)
+    (hf : ContDiff Real 3 f)
+    (hL1_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 1 f x i| <= L1)
+    (hL2_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 2 f x i| <= L2)
+    (hL3_bound : forall (i : Fin n) (x : Fin n -> Real),
+      |coordinatePartialDerivative 3 f x i| <= L3) :
+    abs ((∫ ω, f (X ω) ∂μ) - ∫ ω, f (Y ω) ∂μ) <=
+      (Finset.univ.sum fun i : Fin n =>
+        @firstMomentError Ω mΩ n μ (pastSigma X)
+            (coordinateProcess X) (coordinateProcess Y) i * L1 +
+          (1 / 2 : Real) *
+            @secondMomentError Ω mΩ n μ (pastSigma X)
+              (coordinateProcess X) (coordinateProcess Y) i * L2) +
+        (1 / 6 : Real) * (n : Real) * L3 * M3 := by
+  -- Product-couple the two original random vectors: `X` uses the first
+  -- coordinate and `Y` uses the second.
+  let Xp : Ω × Ω -> Fin n -> Real := fun p i => X p.1 i
+  let Yp : Ω × Ω -> Fin n -> Real := fun p i => Y p.2 i
+  have hfst : MeasurePreserving (fun p : Ω × Ω => p.1) (μ.prod μ) μ :=
+    measurePreserving_fst_prod (Ω := Ω) μ
+  have hsnd : MeasurePreserving (fun p : Ω × Ω => p.2) (μ.prod μ) μ :=
+    measurePreserving_snd_prod (Ω := Ω) μ
+  -- Third absolute moments give the first and second moments needed in the
+  -- product-space conditional errors.
+  have hx : forall i : Fin n, Integrable (fun ω => X ω i) μ := fun i =>
+    integrable_of_integrable_abs_cube
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (x := fun ω => X ω i)
+      (hX_meas i).aestronglyMeasurable (hx3 i)
+  have hx2 : forall i : Fin n, Integrable (fun ω => (X ω i) ^ 2) μ := fun i =>
+    integrable_sq_of_integrable_abs_cube
+      (Ω := Ω) (mΩ := mΩ) (μ := μ) (x := fun ω => X ω i)
+      (hX_meas i).aestronglyMeasurable (hx3 i)
+  have hXp_meas : forall i : Fin n,
+      @Measurable (Ω × Ω) Real _ (borel Real) (fun p => Xp p i) := by
+    intro i
+    simpa [Xp] using (hX_meas i).comp measurable_fst
+  have hYp_meas : forall i : Fin n,
+      @Measurable (Ω × Ω) Real _ (borel Real) (fun p => Yp p i) := by
+    intro i
+    simpa [Yp] using (hY_meas i).comp measurable_snd
+  -- On the product space, the lifted `X` and `Y` sigma-algebras are independent
+  -- because they live on different projections.
+  have hindXYp : Indep (vectorSigma Xp) (vectorSigma Yp) (μ.prod μ) := by
+    have hproj : Indep (MeasurableSpace.comap (fun p : Ω × Ω => p.1) mΩ)
+        (MeasurableSpace.comap (fun p : Ω × Ω => p.2) mΩ) (μ.prod μ) :=
+      indep_fst_snd_prod μ μ
+    have hleft : vectorSigma Xp <= MeasurableSpace.comap Prod.fst mΩ := by
+      simpa [Xp] using vectorSigma_prod_fst_le
+        (Ω := Ω) (mΩ := mΩ) (X := X) hX_meas
+    have hright : vectorSigma Yp <= MeasurableSpace.comap Prod.snd mΩ := by
+      simpa [Yp] using vectorSigma_prod_snd_le
+        (Ω := Ω) (mΩ := mΩ) (Y := Y) hY_meas
+    exact indep_of_indep_of_le_right (indep_of_indep_of_le_left hproj hleft) hright
+  have hY_le : forall i : Fin n,
+      MeasurableSpace.comap (fun ω => Y ω i) (borel Real) <= mΩ := fun i =>
+    (hY_meas i).comap_le
+  -- Mutual independence of the original `Y_i` pulls back through the second
+  -- projection.
+  have hYp_indep : iIndep (fun i : Fin n =>
+      MeasurableSpace.comap (fun p => Yp p i) (borel Real)) (μ.prod μ) := by
+    have hpull := iIndep_comap_measurePreserving
+      (Α := Ω × Ω) (Β := Ω) (ι := Fin n)
+      (μΑ := μ.prod μ) (μΒ := μ) (g := fun p : Ω × Ω => p.2)
+      hsnd hY_le hY_indep
+    simpa [Yp, MeasurableSpace.comap_comp, Function.comp_def] using hpull
+  have hx3p : forall i : Fin n, Integrable (fun p : Ω × Ω => |Xp p i| ^ 3) (μ.prod μ) := by
+    intro i
+    simpa [Xp, Function.comp_def] using (hfst.integrable_comp (hx3 i).1).2 (hx3 i)
+  have hy3p : forall i : Fin n, Integrable (fun p : Ω × Ω => |Yp p i| ^ 3) (μ.prod μ) := by
+    intro i
+    simpa [Yp, Function.comp_def] using (hsnd.integrable_comp (hy3 i).1).2 (hy3 i)
+  -- The uniform third-moment bound is unchanged by projection.
+  have hM3p : forall i : Fin n,
+      (∫ p : Ω × Ω, |Xp p i| ^ 3 ∂(μ.prod μ)) +
+          ∫ p : Ω × Ω, |Yp p i| ^ 3 ∂(μ.prod μ) <= M3 := by
+    intro i
+    have hIx :
+        (∫ p : Ω × Ω, |Xp p i| ^ 3 ∂(μ.prod μ)) =
+          ∫ ω, |X ω i| ^ 3 ∂μ := by
+      simpa [Xp] using (integral_fun_fst (μ := μ) (ν := μ)
+        (f := fun ω => |X ω i| ^ 3))
+    have hIy :
+        (∫ p : Ω × Ω, |Yp p i| ^ 3 ∂(μ.prod μ)) =
+          ∫ ω, |Y ω i| ^ 3 ∂μ := by
+      simpa [Yp] using (integral_fun_snd (μ := μ) (ν := μ)
+        (f := fun ω => |Y ω i| ^ 3))
+    simpa [hIx, hIy] using hM3 i
+  -- The product-space `A_i` and `B_i` are exactly the original errors.
+  have hA : forall i : Fin n,
+      @firstMomentError (Ω × Ω) _ n (μ.prod μ) (pastSigma Xp)
+          (coordinateProcess Xp) (coordinateProcess Yp) i =
+        @firstMomentError Ω mΩ n μ (pastSigma X)
+          (coordinateProcess X) (coordinateProcess Y) i := by
+    intro i
+    simpa [Xp, Yp] using
+      firstMomentError_prod_eq (Ω := Ω) (mΩ := mΩ) μ X Y i hX_meas (hx i)
+  have hB : forall i : Fin n,
+      @secondMomentError (Ω × Ω) _ n (μ.prod μ) (pastSigma Xp)
+          (coordinateProcess Xp) (coordinateProcess Yp) i =
+        @secondMomentError Ω mΩ n μ (pastSigma X)
+          (coordinateProcess X) (coordinateProcess Y) i := by
+    intro i
+    simpa [Xp, Yp] using
+      secondMomentError_prod_eq (Ω := Ω) (mΩ := mΩ) μ X Y i hX_meas (hx2 i)
+  -- Apply the internal independent-coupling theorem on `Ω × Ω`.
+  have hprod :=
+    theoremOneOne_paper_statement_independent_coupling
+      (Ω := Ω × Ω) (mΩ := inferInstance) (μ.prod μ) Xp Yp f L1 L2 L3 M3
+      hXp_meas hYp_meas hindXYp hYp_indep hx3p hy3p hM3p
+      hf hL1_bound hL2_bound hL3_bound
+  have hIntX :
+      (∫ p : Ω × Ω, f (Xp p) ∂(μ.prod μ)) = ∫ ω, f (X ω) ∂μ := by
+    simpa [Xp] using (integral_fun_fst (μ := μ) (ν := μ) (f := fun ω => f (X ω)))
+  have hIntY :
+      (∫ p : Ω × Ω, f (Yp p) ∂(μ.prod μ)) = ∫ ω, f (Y ω) ∂μ := by
+    simpa [Yp] using (integral_fun_snd (μ := μ) (ν := μ) (f := fun ω => f (Y ω)))
+  -- Finally rewrite the product-space expectations and errors back to the
+  -- original probability space.
+  simpa [Xp, Yp, hA, hB, integral_fun_fst, integral_fun_snd,
+    hIntX, hIntY, mul_assoc, mul_left_comm, mul_comm] using hprod
+
+end Lindeberg
+
